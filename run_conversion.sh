@@ -5,7 +5,7 @@ START_YEAR=2018
 END_YEAR=2023
 # 学習データ期間 (統計量計算用)
 TRAIN_START_YEAR=2018
-TRAIN_END_YEAR=2018 # 統計量を計算する期間を定義
+TRAIN_END_YEAR=2023 # 統計量を計算する期間を定義
 
 MAX_WORKERS=22 # マシンのコア数に合わせて調整
 
@@ -102,3 +102,5 @@ echo "=================================================="
 echo "All processing finished successfully."
 echo "Final NetCDF files are in: ${OUTPUT_DIR}"
 echo "=================================================="
+
+# nohup ./run_conversion.sh > conversion.log 2>&1 &

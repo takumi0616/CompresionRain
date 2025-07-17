@@ -15,7 +15,8 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-from torch.cuda.amp import GradScaler, autocast
+# torch.ampを直接使うように変更
+from torch.amp import GradScaler, autocast
 
 # swin_unet.py からモデルをインポート
 from swin_unet import SwinTransformerSys
@@ -156,8 +157,8 @@ def train_one_epoch(rank, model, dataloader, optimizer, criterion, scaler):
         
         optimizer.zero_grad()
         
-        # AMPを有効化
-        with autocast():
+        # AMPを有効化 (推奨される記法に変更)
+        with autocast(device_type='cuda', dtype=torch.float16):
             outputs = model(inputs)
             loss = criterion(outputs, targets)
         
@@ -187,7 +188,8 @@ def validate_one_epoch(rank, model, dataloader, criterion):
         for inputs, targets in progress_bar:
             inputs, targets = inputs.to(rank), targets.to(rank)
             
-            with autocast():
+            # AMPを有効化 (推奨される記法に変更)
+            with autocast(device_type='cuda', dtype=torch.float16):
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 
@@ -211,8 +213,8 @@ def visualize_results(rank, model, dataloader, num_samples=2):
     inputs, targets = inputs.to(rank), targets.to(rank)
 
     with torch.no_grad():
-        with autocast():
-            # DDPでラップされたモデルは .module で元のモデルにアクセス
+        # AMPを有効化 (推奨される記法に変更)
+        with autocast(device_type='cuda', dtype=torch.float16):
             outputs = model.module(inputs)
         outputs = torch.relu(outputs)
 
@@ -273,7 +275,7 @@ def visualize_results(rank, model, dataloader, num_samples=2):
         
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig(f'result_sample_{i+1}.png')
-        plt.close(fig) # メモリリークを防ぐために明示的に閉じる
+        plt.close(fig)
 
 def plot_loss_curve(train_losses, val_losses, save_path):
     """損失曲線をプロットして保存する"""
@@ -327,8 +329,9 @@ def main_worker(rank, world_size):
 
     # --- 損失関数、オプティマイザ、AMPスケーラーの準備 ---
     criterion = custom_loss_function
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * world_size) # 学習率をスケール
-    scaler = GradScaler()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * world_size)
+    # GradScalerの初期化 (推奨される記法に変更)
+    scaler = GradScaler(device='cuda')
     
     # --- 学習ループ ---
     if rank == 0:
@@ -337,7 +340,7 @@ def main_worker(rank, world_size):
     train_loss_history = []
     val_loss_history = []
     
-    global epoch # tqdmでエポック番号を表示するためにグローバル変数として扱う
+    global epoch
     for epoch in range(NUM_EPOCHS):
         
         train_loss = train_one_epoch(rank, model, train_loader, optimizer, criterion, scaler)

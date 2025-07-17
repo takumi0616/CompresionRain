@@ -247,23 +247,19 @@ def convert_data(args):
 
     temp_dir = None
     try:
-        # 統計量ファイルを読み込み
         stats_ds = xr.open_dataset(args.stats_file)
         print(f"Loaded statistics from: {args.stats_file}")
 
-        # 一時ディレクトリを作成
         Path(args.temp_dir).mkdir(parents=True, exist_ok=True)
         temp_dir = tempfile.mkdtemp(prefix=f"convert_{args.start_date[:4]}_", dir=args.temp_dir)
         print(f"Created temporary directory for conversion: {temp_dir}")
 
-        # ③ 3時間ごとの時刻リストを生成
         base_times = []
         date_range = pd.date_range(start=args.start_date, end=args.end_date, freq='D')
         for date in date_range:
-            for hour in range(0, 24, 3): # 0, 3, 6, ..., 21
+            for hour in range(0, 24, 3):
                 base_times.append(date + pd.Timedelta(hours=hour))
 
-        # 並列処理で該当年の一時ファイルを作成
         desc = f"Processing data for {args.start_date[:4]}"
         temp_files = run_parallel_processing(create_temporary_dataset, base_times, args.msm_dir, temp_dir, args.max_workers, desc)
         
@@ -272,46 +268,60 @@ def convert_data(args):
             return
 
         print(f"\nConcatenating and standardizing {len(temp_files)} files...")
-        # Daskを使って全一時ファイルを結合
-        with xr.open_mfdataset(sorted(temp_files), engine='h5netcdf', combine='by_coords', parallel=True, chunks={'time': 10}) as ds:
+        
+        # ======================= 改善点 1: 読み込み時のチャンク設定 =======================
+        # Daskを使って全一時ファイルを結合する際に、時間方向のチャンクを指定
+        with xr.open_mfdataset(
+            sorted(temp_files), 
+            engine='h5netcdf', 
+            combine='by_coords', 
+            parallel=True, 
+            # 学習時のアクセスパターンに合わせてtimeのチャンクを1に設定
+            chunks={'time': 1} 
+        ) as ds:
             
-            # ②-1. 各変数を標準化
             standardized_ds = xr.Dataset(coords=ds.coords)
             for var in ds.data_vars:
                 if f'{var}_mean' in stats_ds and f'{var}_std' in stats_ds:
                     mean = stats_ds[f'{var}_mean']
                     std = stats_ds[f'{var}_std']
-                    # 標準偏差が0の場合はゼロ除算を避ける
                     standardized_ds[var] = xr.where(std > 1e-9, (ds[var] - mean) / std, 0)
                 else:
                     print(f"Warning: Statistics for '{var}' not found. Skipping standardization.")
                     standardized_ds[var] = ds[var]
 
-            # ②-2. 時間特徴量を追加
             time_coord = standardized_ds.coords['time']
             dayofyear = time_coord.dt.dayofyear
             hour = time_coord.dt.hour
             
-            # 年周期 (うるう年を考慮し366日で割る)
             dayofyear_sin_data = np.sin(2 * np.pi * dayofyear / 366.0)
-            standardized_ds['dayofyear_sin'] = (('time',), dayofyear_sin_data.data) # .data を追加
+            standardized_ds['dayofyear_sin'] = (('time',), dayofyear_sin_data.data)
 
             dayofyear_cos_data = np.cos(2 * np.pi * dayofyear / 366.0)
-            standardized_ds['dayofyear_cos'] = (('time',), dayofyear_cos_data.data) # .data を追加
+            standardized_ds['dayofyear_cos'] = (('time',), dayofyear_cos_data.data)
 
-            # 1日周期
             hour_sin_data = np.sin(2 * np.pi * hour / 24.0)
-            standardized_ds['hour_sin'] = (('time',), hour_sin_data.data) # .data を追加
+            standardized_ds['hour_sin'] = (('time',), hour_sin_data.data)
 
             hour_cos_data = np.cos(2 * np.pi * hour / 24.0)
-            standardized_ds['hour_cos'] = (('time',), hour_cos_data.data) # .data を追加
+            standardized_ds['hour_cos'] = (('time',), hour_cos_data.data)
             
             print("Standardization and feature engineering complete. Saving to final file...")
             
-            # 圧縮設定
-            encoding = {var: {'zlib': True, 'complevel': 5} for var in standardized_ds.data_vars}
+            # ======================= 改善点 2: 書き出し時のエンコーディング設定 =======================
+            # 圧縮とチャンク設定を各変数に適用
+            encoding = {}
+            for var in standardized_ds.data_vars:
+                encoding[var] = {
+                    'zlib': True, 
+                    'complevel': 5,
+                    # time次元のチャンクサイズを1に設定
+                    'chunksizes': (1, standardized_ds[var].shape[1], standardized_ds[var].shape[2])
+                }
+            # 時間特徴量も同様に設定
+            for var in ['dayofyear_sin', 'dayofyear_cos', 'hour_sin', 'hour_cos']:
+                encoding[var] = {'zlib': True, 'complevel': 5, 'chunksizes': (1,)}
 
-            # NetCDFファイルへ書き出し
             write_job = standardized_ds.to_netcdf(
                 args.output_file,
                 encoding=encoding,
@@ -327,6 +337,11 @@ def convert_data(args):
             with xr.open_dataset(args.output_file) as final_ds:
                 print("\n[Final Dataset Info]")
                 print(final_ds)
+                # チャンク情報を確認
+                print("\n[Chunking Info]")
+                for var in final_ds.data_vars:
+                    if hasattr(final_ds[var].encoding, 'chunksizes'):
+                         print(f"- {var}: {final_ds[var].encoding['chunksizes']}")
 
     finally:
         if temp_dir and Path(temp_dir).exists():
