@@ -1,0 +1,7 @@
+*.pyc
+__pycache__/
+.DS_Store
+*.nc
+MSM_data/
+output_nc/
+*.log
