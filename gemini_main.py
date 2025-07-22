@@ -1,91 +1,99 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 # gemini_main.py
 
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-import xarray as xr
-import numpy as np
-import matplotlib.pyplot as plt
 import os
-from tqdm import tqdm
 import warnings
 
-# DDP, AMP, compileのためのインポート
-import torch.multiprocessing as mp
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-# torch.ampを直接使うように変更
-from torch.amp import GradScaler, autocast
-
-# swin_unet.py からモデルをインポート
+import torch.multiprocessing as mp
+import torch.nn as nn
+import xarray as xr
 from swin_unet import SwinTransformerSys
+from torch.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
 
-# 警告を非表示
+# 警告を非表示 (xarrayやpygribが出すものを抑制)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ==============================================================================
-# 1. 設定/ハイパーパラメータ
+# 1. 設定 & ハイパーパラメータ
 # ==============================================================================
-# データファイルパス
-TRAIN_FILES = ['./output_nc/2018.nc', './output_nc/2019.nc']
-VALID_FILE = ['./output_nc/2020.nc']
+# --- データパス設定 ---
+# 学習に使用するNetCDFファイル (複数年指定可能)
+TRAIN_FILES = ['./output_nc/2018.nc', './output_nc/2019.nc', './output_nc/2020.nc', './output_nc/2021.nc']
+# 検証に使用するNetCDFファイル
+VALID_FILE = ['./output_nc/2022.nc']
+# モデルやプロットの保存先
+MODEL_SAVE_PATH = 'best_swin_unet_model_ddp.pth'
+PLOT_SAVE_PATH = 'loss_curve.png'
+RESULT_IMG_DIR = 'result_images' # 結果画像の保存ディレクトリ
 
-# 学習パラメータ
-# バッチサイズはGPUごとのサイズ。合計バッチサイズは BATCH_SIZE * WORLD_SIZE となります。
-BATCH_SIZE = 8
-NUM_EPOCHS = 5
+# --- 学習パラメータ ---
+# 各GPUあたりのバッチサイズ (合計バッチサイズは BATCH_SIZE * WORLD_SIZE)
+BATCH_SIZE = 4
+NUM_EPOCHS = 20
+# 学習率 (DDPではGPU数に応じてスケールさせるのが一般的)
 LEARNING_RATE = 1e-4
 
-# モデルパラメータ
+# --- モデルパラメータ ---
 IMG_SIZE = 480
 PATCH_SIZE = 4
+# モデルの出力チャネル数 (FT=4, 5, 6 の3つ)
+NUM_CLASSES = 3
 
-# NetCDF内の変数リスト
-BASE_VARS = [
+# --- 変数定義 ---
+# モデルの入力に使用する変数リスト (FT=3, FT=6)
+# `Prec` は特別扱いするため、このリストからは除外
+INPUT_VARS_COMMON = [
     'Prmsl', 'U10m', 'V10m', 'T2m', 'U975', 'V975', 'T975',
     'U950', 'V950', 'T950', 'U925', 'V925', 'T925', 'R925',
     'U850', 'V850', 'T850', 'R850', 'GH500', 'T500', 'R500',
-    'GH300', 'U300', 'V300', 'Prec'
+    'GH300', 'U300', 'V300'
 ]
+# 入力に使用する降水量変数
+INPUT_VARS_PREC = ['Prec_ft3', 'Prec_4_6h_sum', 'Prec_6_9h_sum']
+# 時間特徴量
 TIME_VARS = ['dayofyear_sin', 'dayofyear_cos', 'hour_sin', 'hour_cos']
 
-# 入力チャネル数
-IN_CHANS = len(BASE_VARS) * 2 - 1 + len(TIME_VARS)
-# 出力チャネル数
-NUM_CLASSES = 3
-MODEL_SAVE_PATH = 'best_swin_unet_model_ddp.pth'
-PLOT_SAVE_PATH = 'loss_accuracy_plot.png'
+# 目的変数 (教師データ)
+TARGET_VARS_1H = ['Prec_Target_ft4', 'Prec_Target_ft5', 'Prec_Target_ft6']
+TARGET_VAR_SUM = 'Prec_4_6h_sum'
 
+# 入力チャネル数を自動計算
+IN_CHANS = len(INPUT_VARS_COMMON) * 2 + len(INPUT_VARS_PREC) + len(TIME_VARS)
 
 # ==============================================================================
-# 2. DDPセットアップ/クリーンアップ関数
+# 2. DDPセットアップ / クリーンアップ関数
 # ==============================================================================
 def setup_ddp(rank, world_size):
     """DDPのためのプロセスグループを初期化"""
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'  # 任意の空きポート
+    # backendはNVIDIA GPUなら'nccl'が最速
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
 def cleanup_ddp():
     """DDPのプロセスグループを破棄"""
     dist.destroy_process_group()
 
-
 # ==============================================================================
-# 3. データセットクラスの定義 (変更なし)
+# 3. データセットクラスの定義 ★★★ 課題解決のための修正箇所 ★★★
 # ==============================================================================
 class NetCDFDataset(Dataset):
     """
-    複数のNetCDFファイルを扱うためのカスタムデータセット。
-    xarrayの遅延読み込み機能を利用して、メモリに乗り切らない大規模データを効率的に扱います。
+    複数のNetCDFファイルを扱うカスタムデータセット。
+    __getitem__で入力テンソルと、2種類の目的変数テンソルを辞書で返す。
     """
-    def __init__(self, file_paths, base_vars, time_vars):
+    def __init__(self, file_paths):
         super().__init__()
-        # 複数のNetCDFファイルを一つのデータセットとして開く
-        self.ds = xr.open_mfdataset(file_paths, chunks={})
-        self.base_vars = base_vars
-        self.time_vars = time_vars
+        self.ds = xr.open_mfdataset(file_paths, chunks={}, parallel=True)
         self.time_len = len(self.ds['time'])
         self.img_dims = (self.ds.sizes['lat'], self.ds.sizes['lon'])
 
@@ -93,287 +101,330 @@ class NetCDFDataset(Dataset):
         return self.time_len
 
     def __getitem__(self, idx):
-        # 特定のタイムステップのデータをスライスしてメモリに読み込む
+        # 特定のタイムステップの全変数をメモリに読み込む
         sample = self.ds.isel(time=idx).load()
 
         # --- 入力テンソルの作成 ---
         input_channels = []
+        # FT=3とFT=6の共通変数を追加
+        for var in INPUT_VARS_COMMON:
+            # FT=3
+            input_channels.append(np.nan_to_num(sample[f'{var}_ft3'].values))
+            # FT=6
+            input_channels.append(np.nan_to_num(sample[f'{var}_ft6'].values))
 
-        for var in self.base_vars:
-            if var == 'Prec':
-                ft3_var_name = f'{var}_ft3'
-                if ft3_var_name in sample:
-                    ft3_data = np.nan_to_num(sample[ft3_var_name].values)
-                    input_channels.append(ft3_data)
-            else:
-                ft3_var_name = f'{var}_ft3'
-                ft3_data = np.nan_to_num(sample[ft3_var_name].values)
-                input_channels.append(ft3_data)
-                
-                ft6_var_name = f'{var}_ft6'
-                ft6_data = np.nan_to_num(sample[ft6_var_name].values)
-                input_channels.append(ft6_data)
+        # 降水量変数を追加
+        for var in INPUT_VARS_PREC:
+            input_channels.append(np.nan_to_num(sample[var].values))
 
+        # 時間特徴量を追加 (空間方向にブロードキャスト)
         h, w = self.img_dims
-        for tvar in self.time_vars:
+        for tvar in TIME_VARS:
             val = sample[tvar].item()
             channel = np.full((h, w), val, dtype=np.float32)
             input_channels.append(channel)
 
-        input_array = np.stack(input_channels, axis=0)
+        input_tensor = torch.from_numpy(np.stack(input_channels, axis=0)).float()
 
         # --- 教師データテンソルの作成 ---
-        target_array = np.nan_to_num(sample['Prec_ft6'].values)
-        
-        input_tensor = torch.from_numpy(input_array).float()
-        target_tensor = torch.from_numpy(target_array).float().unsqueeze(0)
+        # 1. 1時間ごとの降水量 (3チャネル)
+        target_1h_channels = [np.nan_to_num(sample[var].values) for var in TARGET_VARS_1H]
+        target_1h_tensor = torch.from_numpy(np.stack(target_1h_channels, axis=0)).float()
 
-        return input_tensor, target_tensor
+        # 2. 3時間積算降水量 (1チャネル)
+        target_sum_tensor = torch.from_numpy(np.nan_to_num(sample[TARGET_VAR_SUM].values)).float().unsqueeze(0)
 
+        return {
+            "input": input_tensor,
+            "target_1h": target_1h_tensor,
+            "target_sum": target_sum_tensor
+        }
 
 # ==============================================================================
-# 4. 損失関数、学習・検証、可視化の各関数の定義
+# 4. 損失関数、学習・可視化関数 ★★★ 課題解決のための修正箇所 ★★★
 # ==============================================================================
-def custom_loss_function(output, target):
-    """指定された損失関数 (RMSE)"""
+def rmse_loss(pred, target):
+    """単純なRMSEを計算するヘルパー関数"""
+    return torch.sqrt(nn.functional.mse_loss(pred, target))
+
+def custom_loss_function(output, targets):
+    """
+    課題仕様に準拠した複合損失関数。
+    - L1: 1時間ごとの降水量に対するRMSE
+    - L2: 3時間積算降水量に対するRMSE
+    - Total Loss = L1 + L2
+    """
+    # モデル出力は負の値を取りうるため、物理的にありえない負の降水量を0に補正
     output = torch.relu(output)
-    predicted_sum = torch.sum(output, dim=1, keepdim=True)
-    mse = nn.functional.mse_loss(predicted_sum, target)
-    rmse = torch.sqrt(mse)
-    return rmse
 
-def train_one_epoch(rank, model, dataloader, optimizer, criterion, scaler):
-    """1エポック分の学習処理 (DDP, AMP対応)"""
+    # --- L1: 1時間ごとのRMSE ---
+    target_1h = targets['target_1h']
+    loss_1h_rmse = rmse_loss(output, target_1h)
+
+    # --- L2: 3時間積算のRMSE ---
+    predicted_sum = torch.sum(output, dim=1, keepdim=True)
+    target_sum = targets['target_sum']
+    loss_sum_rmse = rmse_loss(predicted_sum, target_sum)
+
+    # --- Total Loss ---
+    total_loss = loss_1h_rmse + loss_sum_rmse
+    
+    # 損失の内訳も返すことで、学習状況のモニタリングを容易にする
+    return total_loss, loss_1h_rmse, loss_sum_rmse
+
+def train_one_epoch(rank, model, dataloader, optimizer, scaler):
+    """1エポック分の学習処理"""
     model.train()
-    total_loss = 0.0
-    # DistributedSamplerを使用する場合、エポックごとに手動で設定する必要がある
+    total_loss, total_1h_rmse, total_sum_rmse = 0.0, 0.0, 0.0
     dataloader.sampler.set_epoch(epoch)
     
-    # メインプロセス(rank 0)でのみプログレスバーを表示
-    progress_bar = tqdm(dataloader, desc=f"Training Epoch {epoch+1}", disable=(rank != 0))
+    progress_bar = tqdm(dataloader, desc=f"Train Epoch {epoch+1}", disable=(rank != 0), leave=False)
     
-    for inputs, targets in progress_bar:
-        inputs, targets = inputs.to(rank), targets.to(rank)
+    for batch in progress_bar:
+        inputs = batch['input'].to(rank, non_blocking=True)
+        targets = {k: v.to(rank, non_blocking=True) for k, v in batch.items() if k != 'input'}
         
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         
-        # AMPを有効化 (推奨される記法に変更)
         with autocast(device_type='cuda', dtype=torch.float16):
             outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            loss, loss_1h, loss_sum = custom_loss_function(outputs, targets)
         
-        # スケーラーを使って勾配を計算
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
         
         total_loss += loss.item()
+        total_1h_rmse += loss_1h.item()
+        total_sum_rmse += loss_sum.item()
+        
+        if rank == 0:
+            progress_bar.set_postfix(loss=loss.item(), rmse_1h=loss_1h.item(), rmse_sum=loss_sum.item())
+            
+    # 全プロセスで平均損失を集計
+    avg_loss = torch.tensor([total_loss, total_1h_rmse, total_sum_rmse], device=rank) / len(dataloader)
+    dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
+    
+    return avg_loss.cpu().numpy()
+
+@torch.no_grad()
+def validate_one_epoch(rank, model, dataloader):
+    """1エポック分の検証処理"""
+    model.eval()
+    total_loss, total_1h_rmse, total_sum_rmse = 0.0, 0.0, 0.0
+    progress_bar = tqdm(dataloader, desc=f"Valid Epoch {epoch+1}", disable=(rank != 0), leave=False)
+    
+    for batch in progress_bar:
+        inputs = batch['input'].to(rank, non_blocking=True)
+        targets = {k: v.to(rank, non_blocking=True) for k, v in batch.items() if k != 'input'}
+        
+        with autocast(device_type='cuda', dtype=torch.float16):
+            outputs = model(inputs)
+            loss, loss_1h, loss_sum = custom_loss_function(outputs, targets)
+            
+        total_loss += loss.item()
+        total_1h_rmse += loss_1h.item()
+        total_sum_rmse += loss_sum.item()
         if rank == 0:
             progress_bar.set_postfix(loss=loss.item())
-            
-    # 全プロセスで平均損失を計算
-    avg_loss = torch.tensor(total_loss / len(dataloader), device=rank)
+
+    avg_loss = torch.tensor([total_loss, total_1h_rmse, total_sum_rmse], device=rank) / len(dataloader)
     dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
     
-    return avg_loss.item()
+    return avg_loss.cpu().numpy()
 
-def validate_one_epoch(rank, model, dataloader, criterion):
-    """1エポック分の検証処理 (DDP, AMP対応)"""
+@torch.no_grad()
+def visualize_results(rank, model, dataloader, epoch, num_samples=2):
+    """学習結果を可視化して画像ファイルとして保存"""
     model.eval()
-    total_loss = 0.0
+    # 最初のバッチを取得
+    batch = next(iter(dataloader))
+    inputs = batch['input'][:num_samples].to(rank)
+    targets_1h = batch['target_1h'][:num_samples]
+    targets_sum = batch['target_sum'][:num_samples]
+
+    with autocast(device_type='cuda', dtype=torch.float16):
+        outputs = model.module(inputs)
+    outputs = torch.relu(outputs).cpu()
     
-    progress_bar = tqdm(dataloader, desc=f"Validating Epoch {epoch+1}", disable=(rank != 0))
+    # 3時間積算値を計算
+    outputs_sum = outputs.sum(dim=1, keepdim=True)
     
-    with torch.no_grad():
-        for inputs, targets in progress_bar:
-            inputs, targets = inputs.to(rank), targets.to(rank)
+    os.makedirs(RESULT_IMG_DIR, exist_ok=True)
+
+    for i in range(num_samples):
+        fig, axes = plt.subplots(3, 4, figsize=(20, 15))
+        fig.suptitle(f'Epoch {epoch+1} - Sample {i+1} on GPU {rank}', fontsize=18)
+        
+        # 共通のカラーマップと最大値
+        prec_max = max(targets_sum[i].max(), outputs_sum[i].max(), 1.0)
+        
+        # --- Row 0: 入力と積算値の比較 ---
+        ax = axes[0, 0]
+        im = ax.imshow(inputs[i, 0].cpu().numpy(), cmap='viridis') # Prmsl_ft3
+        ax.set_title('Input: Prmsl_ft3')
+        fig.colorbar(im, ax=ax, shrink=0.8)
+
+        ax = axes[0, 1]
+        im = ax.imshow(inputs[i, 1].cpu().numpy(), cmap='viridis') # Prmsl_ft6
+        ax.set_title('Input: Prmsl_ft6')
+        fig.colorbar(im, ax=ax, shrink=0.8)
+
+        ax = axes[0, 2]
+        im = ax.imshow(targets_sum[i, 0], cmap='Blues', vmin=0, vmax=prec_max)
+        ax.set_title(f'Target Sum: {targets_sum[i].sum():.2f} mm')
+        fig.colorbar(im, ax=ax, shrink=0.8)
+
+        ax = axes[0, 3]
+        im = ax.imshow(outputs_sum[i, 0], cmap='Blues', vmin=0, vmax=prec_max)
+        ax.set_title(f'Prediction Sum: {outputs_sum[i].sum():.2f} mm')
+        fig.colorbar(im, ax=ax, shrink=0.8)
+
+        # --- Row 1 & 2: 1時間ごとの比較 ---
+        for ft_idx in range(3):
+            ft = ft_idx + 4
+            target_img = targets_1h[i, ft_idx]
+            pred_img = outputs[i, ft_idx]
             
-            # AMPを有効化 (推奨される記法に変更)
-            with autocast(device_type='cuda', dtype=torch.float16):
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                
-            total_loss += loss.item()
-            if rank == 0:
-                progress_bar.set_postfix(loss=loss.item())
+            # Target
+            ax = axes[1, ft_idx]
+            im = ax.imshow(target_img, cmap='Blues', vmin=0, vmax=prec_max/2)
+            ax.set_title(f'Target FT={ft} ({target_img.sum():.2f} mm)')
+            fig.colorbar(im, ax=ax, shrink=0.8)
+            
+            # Prediction
+            ax = axes[2, ft_idx]
+            im = ax.imshow(pred_img, cmap='Blues', vmin=0, vmax=prec_max/2)
+            ax.set_title(f'Prediction FT={ft} ({pred_img.sum():.2f} mm)')
+            fig.colorbar(im, ax=ax, shrink=0.8)
 
-    # 全プロセスで平均損失を計算
-    avg_loss = torch.tensor(total_loss / len(dataloader), device=rank)
-    dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
-    
-    return avg_loss.item()
+        # エラーマップ
+        ax = axes[2, 3]
+        error_map = outputs_sum[i, 0] - targets_sum[i, 0]
+        err_max = torch.abs(error_map).max()
+        im = ax.imshow(error_map, cmap='coolwarm', vmin=-err_max, vmax=err_max)
+        ax.set_title('Error (Pred_sum - Target_sum)')
+        fig.colorbar(im, ax=ax, shrink=0.8)
 
-def visualize_results(rank, model, dataloader, num_samples=2):
-    """学習結果を可視化する (DDP対応)"""
-    model.eval()
-    
-    # dataloaderからいくつかのサンプルを取得
-    # DistributedSamplerはデータを分割するので、1つのバッチで十分
-    inputs, targets = next(iter(dataloader))
-    inputs, targets = inputs.to(rank), targets.to(rank)
-
-    with torch.no_grad():
-        # AMPを有効化 (推奨される記法に変更)
-        with autocast(device_type='cuda', dtype=torch.float16):
-            outputs = model.module(inputs)
-        outputs = torch.relu(outputs)
-
-    # CPUにデータを移し、Numpy配列に変換
-    inputs_np = inputs.cpu().numpy()
-    targets_np = targets.cpu().numpy()
-    outputs_np = outputs.cpu().numpy()
-
-    # 可視化
-    for i in range(min(num_samples, len(inputs))):
-        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
-        fig.suptitle(f'Sample {i+1} on GPU {rank}', fontsize=16)
-        
-        prmsl_ft3 = inputs_np[i, 0, :, :]
-        prmsl_ft6 = inputs_np[i, 1, :, :]
-        
-        im1 = axes[0, 0].imshow(prmsl_ft3, cmap='viridis')
-        axes[0, 0].set_title('Input: Prmsl_ft3')
-        fig.colorbar(im1, ax=axes[0, 0])
-        
-        im2 = axes[0, 1].imshow(prmsl_ft6, cmap='viridis')
-        axes[0, 1].set_title('Input: Prmsl_ft6')
-        fig.colorbar(im2, ax=axes[0, 1])
-
-        prec_max = max(targets_np[i].max(), outputs_np[i].sum(axis=0).max())
-        
-        target_prec_sum = targets_np[i, 0, :, :]
-        im3 = axes[0, 2].imshow(target_prec_sum, cmap='Blues', vmin=0, vmax=prec_max)
-        axes[0, 2].set_title('Target: Prec_ft6 (Sum)')
-        fig.colorbar(im3, ax=axes[0, 2])
-        
-        pred_prec_sum = outputs_np[i].sum(axis=0)
-        im4 = axes[0, 3].imshow(pred_prec_sum, cmap='Blues', vmin=0, vmax=prec_max)
-        axes[0, 3].set_title('Prediction (Sum)')
-        fig.colorbar(im4, ax=axes[0, 3])
-
-        pred_ft4 = outputs_np[i, 0, :, :]
-        pred_ft5 = outputs_np[i, 1, :, :]
-        pred_ft6 = outputs_np[i, 2, :, :]
-        
-        im5 = axes[1, 0].imshow(pred_ft4, cmap='Blues', vmin=0)
-        axes[1, 0].set_title('Prediction: Prec FT=4')
-        fig.colorbar(im5, ax=axes[1, 0])
-        
-        im6 = axes[1, 1].imshow(pred_ft5, cmap='Blues', vmin=0)
-        axes[1, 1].set_title('Prediction: Prec FT=5')
-        fig.colorbar(im6, ax=axes[1, 1])
-
-        im7 = axes[1, 2].imshow(pred_ft6, cmap='Blues', vmin=0)
-        axes[1, 2].set_title('Prediction: Prec FT=6')
-        fig.colorbar(im7, ax=axes[1, 2])
-        
-        error_map = pred_prec_sum - target_prec_sum
-        err_max = np.abs(error_map).max()
-        im8 = axes[1, 3].imshow(error_map, cmap='coolwarm', vmin=-err_max, vmax=err_max)
-        axes[1, 3].set_title('Error (Pred_sum - Target_sum)')
-        fig.colorbar(im8, ax=axes[1, 3])
-        
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        plt.savefig(f'result_sample_{i+1}.png')
+        plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+        plt.savefig(f'{RESULT_IMG_DIR}/epoch_{epoch+1:03d}_sample_{i+1}.png')
         plt.close(fig)
 
-def plot_loss_curve(train_losses, val_losses, save_path):
-    """損失曲線をプロットして保存する"""
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
-    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss (RMSE)')
-    plt.title('Training and Validation Loss Curve')
+def plot_loss_curve(history, save_path):
+    """損失曲線をプロットして保存"""
+    plt.figure(figsize=(12, 8))
+    epochs = range(1, len(history['train_loss']) + 1)
+    
+    plt.subplot(2, 1, 1)
+    plt.plot(epochs, history['train_loss'], 'bo-', label='Training Total Loss')
+    plt.plot(epochs, history['val_loss'], 'ro-', label='Validation Total Loss')
+    plt.title('Total Loss Curve')
+    plt.ylabel('Loss (RMSE_1h + RMSE_sum)')
     plt.legend()
     plt.grid(True)
+    
+    plt.subplot(2, 2, 3)
+    plt.plot(epochs, history['train_1h_rmse'], 'b.-', label='Train 1h-RMSE')
+    plt.plot(epochs, history['val_1h_rmse'], 'r.-', label='Val 1h-RMSE')
+    plt.title('1-hour RMSE')
+    plt.xlabel('Epoch')
+    plt.ylabel('RMSE')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(2, 2, 4)
+    plt.plot(epochs, history['train_sum_rmse'], 'b.--', label='Train Sum-RMSE')
+    plt.plot(epochs, history['val_sum_rmse'], 'r.--', label='Val Sum-RMSE')
+    plt.title('Sum RMSE')
+    plt.xlabel('Epoch')
+    plt.ylabel('RMSE')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
 
 # ==============================================================================
-# 5. メインワーカ関数 (各プロセスで実行される)
+# 5. メインワーカ関数
 # ==============================================================================
 def main_worker(rank, world_size):
     """DDPの各プロセスで実行されるメインの学習処理"""
     setup_ddp(rank, world_size)
     
     if rank == 0:
-        print(f"Running DDP on {world_size} GPUs.")
+        print(f"INFO: Running DDP on {world_size} GPUs. Total batch size: {BATCH_SIZE * world_size}")
+        print(f"INFO: Input channels: {IN_CHANS}")
 
-    # --- データセットとデータローダーの準備 ---
-    train_dataset = NetCDFDataset(TRAIN_FILES, BASE_VARS, TIME_VARS)
-    valid_dataset = NetCDFDataset(VALID_FILE, BASE_VARS, TIME_VARS)
-    
+    # --- データセットとデータローダー ---
+    train_dataset = NetCDFDataset(TRAIN_FILES)
+    valid_dataset = NetCDFDataset(VALID_FILE)
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     valid_sampler = DistributedSampler(valid_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-    
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True, sampler=train_sampler)
     valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True, sampler=valid_sampler)
 
-    # --- モデルの準備 ---
+    # --- モデル ---
     model = SwinTransformerSys(
         img_size=IMG_SIZE, patch_size=PATCH_SIZE, in_chans=IN_CHANS, num_classes=NUM_CLASSES,
-        embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=5,
-        mlp_ratio=4., qkv_bias=True, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-        drop_path_rate=0.1, norm_layer=nn.LayerNorm, ape=False, patch_norm=True, use_checkpoint=False
+        embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=7, # Window size is often 7
+        mlp_ratio=4., qkv_bias=True, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
+        norm_layer=nn.LayerNorm, ape=False, patch_norm=True, use_checkpoint=False
     ).to(rank)
-
-    # --- torch.compile と DDP の適用 ---
-    # まずモデルをコンパイルし、その後にDDPでラップするのが推奨される
+    
+    # torch.compile -> DDP ラップ
     model = torch.compile(model, mode="reduce-overhead")
     model = DDP(model, device_ids=[rank], find_unused_parameters=False)
     
-    if rank == 0:
-        print(f"Model initialized with {IN_CHANS} input channels and {NUM_CLASSES} output classes.")
-        print("torch.compile and DDP are enabled.")
-
-    # --- 損失関数、オプティマイザ、AMPスケーラーの準備 ---
-    criterion = custom_loss_function
+    # --- 損失関数、オプティマイザ、スケーラー ---
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * world_size)
-    # GradScalerの初期化 (推奨される記法に変更)
-    scaler = GradScaler(device='cuda')
+    scaler = GradScaler()
     
     # --- 学習ループ ---
     if rank == 0:
-        print("Starting training...")
+        print("INFO: Starting training...")
     best_val_loss = float('inf')
-    train_loss_history = []
-    val_loss_history = []
+    loss_history = {
+        'train_loss': [], 'train_1h_rmse': [], 'train_sum_rmse': [],
+        'val_loss': [], 'val_1h_rmse': [], 'val_sum_rmse': []
+    }
     
     global epoch
     for epoch in range(NUM_EPOCHS):
         
-        train_loss = train_one_epoch(rank, model, train_loader, optimizer, criterion, scaler)
-        val_loss = validate_one_epoch(rank, model, valid_loader, criterion)
+        train_losses = train_one_epoch(rank, model, train_loader, optimizer, scaler)
+        val_losses = validate_one_epoch(rank, model, valid_loader)
         
-        train_loss_history.append(train_loss)
-        val_loss_history.append(val_loss)
+        # 損失を履歴に保存
+        loss_history['train_loss'].append(train_losses[0])
+        loss_history['train_1h_rmse'].append(train_losses[1])
+        loss_history['train_sum_rmse'].append(train_losses[2])
+        loss_history['val_loss'].append(val_losses[0])
+        loss_history['val_1h_rmse'].append(val_losses[1])
+        loss_history['val_sum_rmse'].append(val_losses[2])
 
         if rank == 0:
             print(f"\n--- Epoch {epoch+1}/{NUM_EPOCHS} ---")
-            print(f"Epoch {epoch+1} Training Loss: {train_loss:.4f}")
-            print(f"Epoch {epoch+1} Validation Loss: {val_loss:.4f}")
+            print(f"Train Loss: {train_losses[0]:.4f} (1h: {train_losses[1]:.4f}, sum: {train_losses[2]:.4f})")
+            print(f"Valid Loss: {val_losses[0]:.4f} (1h: {val_losses[1]:.4f}, sum: {val_losses[2]:.4f})")
             
-            # 最も検証ロスが良かったモデルを保存 (rank 0 のみ)
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                # DDPモデルのstate_dictを保存する際は .module を付ける
+            # 最良モデルの保存
+            if val_losses[0] < best_val_loss:
+                best_val_loss = val_losses[0]
                 torch.save(model.module.state_dict(), MODEL_SAVE_PATH)
-                print(f"Saved best model with validation loss: {best_val_loss:.4f}")
+                print(f"INFO: Saved best model with validation loss: {best_val_loss:.4f}")
+            
+            # 定期的に可視化を実行 (例: 5エポックごとと最終エポック)
+            if (epoch + 1) % 5 == 0 or (epoch + 1) == NUM_EPOCHS:
+                print("INFO: Visualizing results...")
+                visualize_results(rank, model, valid_loader, epoch, num_samples=2)
     
     if rank == 0:
-        print("\nTraining finished.")
-        # --- 結果の可視化 (rank 0 のみ) ---
-        print("\nPlotting loss curve...")
-        plot_loss_curve(train_loss_history, val_loss_history, PLOT_SAVE_PATH)
-        print(f"Loss curve saved to '{PLOT_SAVE_PATH}'.")
-
-        print("\nVisualizing results with the best model...")
-        # 保存した最良モデルを読み込む
-        best_model_state = torch.load(MODEL_SAVE_PATH, map_location=torch.device(rank))
-        model.module.load_state_dict(best_model_state)
-        visualize_results(rank, model, valid_loader, num_samples=2)
-        print("Visualization complete. Check for 'result_sample_*.png' files.")
+        print("\nINFO: Training finished.")
+        print("INFO: Plotting loss curve...")
+        plot_loss_curve(loss_history, PLOT_SAVE_PATH)
+        print(f"INFO: Loss curve saved to '{PLOT_SAVE_PATH}'.")
+        print(f"INFO: Result images saved in '{RESULT_IMG_DIR}/'.")
 
     cleanup_ddp()
 
@@ -383,14 +434,14 @@ def main_worker(rank, world_size):
 if __name__ == '__main__':
     world_size = torch.cuda.device_count()
     if world_size > 1:
-        # マルチGPU環境の場合、spawnを使って各GPU用のプロセスを起動
+        print(f"Found {world_size} GPUs. Launching DDP.")
         mp.spawn(main_worker,
                  args=(world_size,),
                  nprocs=world_size,
                  join=True)
     elif world_size == 1:
-        # シングルGPU環境の場合（DDPは使わないが、コード共通化のためワーカを直接実行）
-        print("Running on a single GPU.")
+        print("Found 1 GPU. Running in single-GPU mode.")
+        # DDPのセットアップを簡略化してシングルプロセスで実行
         main_worker(0, 1)
     else:
-        print("No GPU found. This script requires at least one GPU.")
+        print("ERROR: No GPU found. This script requires at least one GPU.")
