@@ -254,9 +254,11 @@ def calc_stats():
             logging.info(f"\n[Statistics Dataset Info]\n{stats_ds}")
 
     finally:
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
-            logging.info(f"Removed temporary directory: {temp_dir}")
+        # ★★★ 修正点1 ★★★
+        # if temp_dir.exists():
+        #     shutil.rmtree(temp_dir)
+        #     logging.info(f"Removed temporary directory: {temp_dir}")
+        logging.info(f"Kept temporary directory for stats: {temp_dir}")
     logging.info(f"Finished [calc_stats] mode in {time.time() - start_time:.2f} seconds.")
 
 def convert_monthly_data(year, month, stats_ds):
@@ -316,9 +318,11 @@ def convert_monthly_data(year, month, stats_ds):
             logging.info(f"Successfully created {output_file}.")
 
     finally:
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
-            logging.info(f"Removed temporary directory: {temp_dir}")
+        # ★★★ 修正点2 ★★★
+        # if temp_dir.exists():
+        #     shutil.rmtree(temp_dir)
+        #     logging.info(f"Removed temporary directory: {temp_dir}")
+        logging.info(f"Kept temporary directory for conversion: {temp_dir}")
     logging.info(f"Finished conversion for {year}-{month:02d} in {time.time() - month_start_time:.2f} seconds.")
 
 
