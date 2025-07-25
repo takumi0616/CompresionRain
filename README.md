@@ -7,6 +7,8 @@ nohup python3 convert_msm_data.py > convert_msm_data.log 2>&1 &
 
 nohup python3 convert_nc.py > convert_nc.log 2>&1 &
 
+nohup python3 check_MSM_data_nc.py > check_MSM_data_nc.log 2>&1 &
+
 ```
 
 タスクの削除
