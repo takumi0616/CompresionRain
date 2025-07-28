@@ -185,3 +185,4 @@ if __name__ == "__main__":
     # 引数で受け取ったファイルパスを使って検証を実行
     validate_netcdf(args.netcdf_file, REQUIREMENTS)
     # 💡---ここまで修正---
+    # python check_nc.py output_nc/201801.nc

@@ -20,7 +20,7 @@ from dask.diagnostics import ProgressBar
 # ==============================================================================
 # 処理対象期間
 START_YEAR = 2018
-END_YEAR = 2018
+END_YEAR = 2023
 
 # 並列処理ワーカー数 (マシンのCPUコア数に合わせて調整)
 MAX_WORKERS = 22
@@ -172,22 +172,27 @@ def process_grib_files(file_paths):
             with pygrib.open(str(prr_path)) as grbs:
                 hourly_prec = {}
                 all_values = []
-                # デバッグ: 各メッセージの情報を出力
-                logging.info(f"Processing precipitation file: {prr_path}")
+                
+                # デバッグ: ファイル情報を出力
+                logging.debug(f"Processing precipitation file: {prr_path}")
+                
+                # 1つのループで全ての処理を行う
                 for i, grb in enumerate(grbs):
-                    logging.info(f"Message {i}: forecastTime={grb.forecastTime}, "
-                               f"startStep={grb.startStep if hasattr(grb, 'startStep') else 'N/A'}, "
-                               f"endStep={grb.endStep if hasattr(grb, 'endStep') else 'N/A'}, "
-                               f"stepRange={grb.stepRange if hasattr(grb, 'stepRange') else 'N/A'}")
+                    # デバッグ情報
+                    logging.debug(f"Message {i}: forecastTime={grb.forecastTime}, "
+                                f"startStep={grb.startStep if hasattr(grb, 'startStep') else 'N/A'}, "
+                                f"endStep={grb.endStep if hasattr(grb, 'endStep') else 'N/A'}, "
+                                f"stepRange={grb.stepRange if hasattr(grb, 'stepRange') else 'N/A'}")
                     
+                    # データの処理
                     all_values.append(grb.values)
                     
-                    # メッセージのインデックスで判断する方法
-                    if i == 0:  # 最初のメッセージ = 4時間目
+                    # forecastTimeが3,4,5の場合、それぞれ4,5,6時間目として保存
+                    if grb.forecastTime == 3:
                         hourly_prec['Prec_Target_ft4'] = grb.values.astype(np.float32)
-                    elif i == 1:  # 2番目のメッセージ = 5時間目
+                    elif grb.forecastTime == 4:
                         hourly_prec['Prec_Target_ft5'] = grb.values.astype(np.float32)
-                    elif i == 2:  # 3番目のメッセージ = 6時間目
+                    elif grb.forecastTime == 5:
                         hourly_prec['Prec_Target_ft6'] = grb.values.astype(np.float32)
                 
                 # 説明変数として3-6時間積算降水量を保存
@@ -239,7 +244,10 @@ def process_single_time_to_dataset(base_time, msm_dir):
         return None
 
 def convert_monthly_data(year, month, msm_dir, output_dir, max_workers):
-    """指定された年月のデータを変換し、月次NetCDFファイルとして保存する"""
+    """
+    指定された年月のデータを変換し、月次NetCDFファイルとして保存する。
+    この関数はディスクに中間ファイルを生成せず、メモリ上で処理を完結させます。
+    """
     month_start_time = time.time()
     logging.info(f"--- Starting conversion for {year}-{month:02d} ---")
     
@@ -248,8 +256,9 @@ def convert_monthly_data(year, month, msm_dir, output_dir, max_workers):
         logging.info(f"File {output_file} already exists. Skipping.")
         return
 
-    # --- 1. 月内の全時刻について並列処理でデータセットを作成 ---
-    logging.info("Starting parallel processing to create in-memory datasets...")
+    # --- 1. 月内の全時刻のデータを並列処理し、メモリ上のリストに格納 ---
+    # ここではディスク書き込みは発生しません。
+    logging.info("Step 1: Processing all time steps in parallel to create in-memory datasets...")
     t_start_parallel = time.time()
     
     start_date = f"{year}-{month:02d}-01"
@@ -279,17 +288,15 @@ def convert_monthly_data(year, month, msm_dir, output_dir, max_workers):
         logging.warning(f"No data was processed for {year}-{month:02d}. Skipping file creation.")
         return
 
-    # --- 2. データセット結合と時間特徴量追加 ---
-    logging.info(f"Concatenating {len(datasets_in_month)} datasets for {year}-{month:02d}...")
+    # --- 2. メモリ上でデータセットを結合し、特徴量を追加 ---
+    logging.info(f"Step 2: Concatenating {len(datasets_in_month)} datasets for {year}-{month:02d} in memory...")
     t_start_concat = time.time()
     
-    # 時刻順にソートしてから結合
     datasets_in_month.sort(key=lambda ds: ds.time.values[0])
     monthly_ds = xr.concat(datasets_in_month, dim='time')
     
     logging.info(f"  - Concatenation completed. Time taken: {time.time() - t_start_concat:.2f} seconds.")
 
-    # 時間特徴量を追加
     t_start_features = time.time()
     time_coord = monthly_ds.coords['time']
     monthly_ds['dayofyear_sin'] = np.sin(2 * np.pi * time_coord.dt.dayofyear / 366.0).astype(np.float32)
@@ -298,8 +305,8 @@ def convert_monthly_data(year, month, msm_dir, output_dir, max_workers):
     monthly_ds['hour_cos']      = np.cos(2 * np.pi * time_coord.dt.hour / 24.0).astype(np.float32)
     logging.info(f"  - Adding time features completed. Time taken: {time.time() - t_start_features:.2f} seconds.")
     
-    # --- 3. ファイル保存 ---
-    logging.info(f"Saving final NetCDF file to {output_file}...")
+    # --- 3. 月次ファイルとしてディスクに保存 ---
+    logging.info(f"Step 3: Saving the final monthly NetCDF file to {output_file}...")
     t_start_save = time.time()
     encoding = {var: {'zlib': True, 'complevel': 5} for var in monthly_ds.data_vars}
     write_job = monthly_ds.to_netcdf(output_file, encoding=encoding, mode='w', engine='h5netcdf', compute=False)
@@ -309,13 +316,23 @@ def convert_monthly_data(year, month, msm_dir, output_dir, max_workers):
         
     logging.info(f"  - Saving to NetCDF completed. Time taken: {time.time() - t_start_save:.2f} seconds.")
     logging.info(f"Successfully created {output_file}.")
+
+    # --- 4. 💡 メモリ解放 ---
+    # この月の処理で使用したメモリ上の巨大なオブジェクトを明示的に削除
+    del datasets_in_month
+    del monthly_ds
+    logging.info("  - Cleared memory for the next month's processing.")
+    
     logging.info(f"Finished conversion for {year}-{month:02d} in {time.time() - month_start_time:.2f} seconds.")
 
 # ==============================================================================
 # --- メイン実行部 ---
 # ==============================================================================
 def main():
-    """メイン処理"""
+    """
+    メイン処理。指定された期間のGRIB2データを月ごとに処理し、
+    月次NetCDFファイル（例：201801.nc）として保存する。
+    """
     setup_logging()
     total_start_time = time.time()
     logging.info("===== MSM GRIB2 to NetCDF Conversion Process Start =====")
@@ -325,21 +342,23 @@ def main():
     logging.info(f"Input GRIB2 directory: {MSM_DIR}")
     logging.info(f"Output NetCDF directory: {OUTPUT_DIR}")
 
-    # --- データ変換 (月次) ---
-    logging.info(f"--- Running in [convert] mode for {START_YEAR} to {END_YEAR} ---")
+    # --- 月次データ変換のループ処理 ---
+    logging.info(f"--- Starting monthly file conversion for the period: {START_YEAR} to {END_YEAR} ---")
     
     total_months = (END_YEAR - START_YEAR + 1) * 12
     processed_months = 0
     conversion_start_time = time.time()
 
+    # 1ヶ月ごとにループを実行
     for year in range(START_YEAR, END_YEAR + 1):
         for month in range(1, 13):
             processed_months += 1
-            logging.info(f"--- Processing month {processed_months} of {total_months} ({year}-{month:02d}) ---")
+            logging.info(f"--- Processing month: {processed_months}/{total_months} ({year}-{month:02d}) ---")
             
+            # 月次ファイルの変換と保存を実行
             convert_monthly_data(year, month, MSM_DIR, OUTPUT_DIR, MAX_WORKERS)
             
-            # --- 進捗報告 ---
+            # --- 進捗状況の報告 ---
             elapsed_time = time.time() - conversion_start_time
             if processed_months > 0:
                 avg_time_per_month = elapsed_time / processed_months
@@ -347,8 +366,8 @@ def main():
                 estimated_time_remaining = avg_time_per_month * remaining_months
                 
                 logging.info(f"Progress: {processed_months}/{total_months} months complete.")
-                logging.info(f"Elapsed time: {datetime.timedelta(seconds=int(elapsed_time))}")
-                logging.info(f"Estimated time remaining: {datetime.timedelta(seconds=int(estimated_time_remaining))}")
+                logging.info(f"  - Elapsed time: {datetime.timedelta(seconds=int(elapsed_time))}")
+                logging.info(f"  - Estimated time remaining: {datetime.timedelta(seconds=int(estimated_time_remaining))}")
             
     total_elapsed = time.time() - total_start_time
     logging.info(f"===== All processes finished. Total execution time: {datetime.timedelta(seconds=int(total_elapsed))} =====")
