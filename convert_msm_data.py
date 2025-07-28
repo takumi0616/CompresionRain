@@ -7,8 +7,6 @@ import xarray as xr
 import pygrib
 import datetime
 import pandas as pd
-import tempfile
-import shutil
 import concurrent.futures
 import time
 import logging
@@ -22,11 +20,7 @@ from dask.diagnostics import ProgressBar
 # ==============================================================================
 # 処理対象期間
 START_YEAR = 2018
-END_YEAR = 2023
-
-# 学習データ期間 (統計量計算用)
-TRAIN_START_YEAR = 2018
-TRAIN_END_YEAR = 2023
+END_YEAR = 2018
 
 # 並列処理ワーカー数 (マシンのCPUコア数に合わせて調整)
 MAX_WORKERS = 22
@@ -34,10 +28,10 @@ MAX_WORKERS = 22
 # --- パス設定 ---
 # このスクリプトが存在するディレクトリを基準にパスを構築
 SCRIPT_DIR = Path(__file__).parent
-MSM_DIR = SCRIPT_DIR / "MSM_data"       # MSM GRIB2データが格納されているルートディレクトリ
-OUTPUT_DIR = SCRIPT_DIR / "output_nc"   # 完成したNetCDFファイルの出力先
-TEMP_ROOT_DIR = OUTPUT_DIR / "temp"     # 一時ファイルの作成場所
-STATS_FILE = OUTPUT_DIR / f"stats_{TRAIN_START_YEAR}-{TRAIN_END_YEAR}.nc" # 統計量ファイル
+# MSM GRIB2データが格納されているルートディレクトリ (ご自身の環境に合わせて変更してください)
+MSM_DIR = Path("/mnt/gpu01/MSM/")
+# 完成したNetCDFファイルの出力先
+OUTPUT_DIR = SCRIPT_DIR / "output_nc"
 
 # ==============================================================================
 # --- ログ設定 ---
@@ -48,6 +42,7 @@ def setup_logging():
     log_dir.mkdir(exist_ok=True)
     log_filename = log_dir / f"conversion_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     
+    # nohupで実行した際にprintと同様にファイルに書き込まれるように、StreamHandlerも使用する
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -56,48 +51,72 @@ def setup_logging():
             logging.StreamHandler()
         ]
     )
-    # tqdmとloggingを連携させる
-    tqdm.pandas()
-    
+    # tqdmはログファイルには出力せず、標準エラー出力にのみ表示する設定
+    tqdm.pandas(file=os.sys.stderr)
+
 # ==============================================================================
 # --- 定数定義 ---
 # ==============================================================================
+# 抽出対象の変数リスト
 MEPS_SURFACE_VARS = {'prmsl': 'Prmsl', '10u': 'U10m', '10v': 'V10m'}
 MEPS_SURFACE_LVL_VARS = {('t', 2): 'T2m'}
 MEPS_PRESSURE_SPEC = {
-    975: ['u', 'v', 't'], 950: ['u', 'v', 't'], 925: ['u', 'v', 't', 'r'],
-    850: ['u', 'v', 't', 'r'], 500: ['gh', 't', 'r'], 300: ['gh', 'u', 'v']
+    975: ['u', 'v', 't'],
+    950: ['u', 'v', 't'],
+    925: ['u', 'v', 't', 'r'],
+    850: ['u', 'v', 't', 'r'],
+    500: ['gh', 't', 'r'],
+    300: ['gh', 'u', 'v']
 }
 PRESSURE_LEVELS = sorted(MEPS_PRESSURE_SPEC.keys())
 
 # --- 座標情報 ---
+# 入力データの格子定義
 MSM_P_LATS = 47.6 - np.arange(253) * 0.1
 MSM_P_LONS = 120.0 + np.arange(241) * 0.125
 MSM_S_LATS = 47.6 - np.arange(505) * 0.05
 MSM_S_LONS = 120.0 + np.arange(481) * 0.0625
+
+# 出力データの格子定義 (480x480)
 OUTPUT_LATS_SLICE = slice(46.95, 23.0)
 OUTPUT_LONS_SLICE = slice(120.0, 149.9375)
+OUTPUT_LATS = 46.95 - np.arange(480) * 0.05
+OUTPUT_LONS = 120.0 + np.arange(480) * 0.0625
 
 # ==============================================================================
 # --- 関数定義 ---
 # ==============================================================================
 def get_pressure_var_name(short_name, level):
+    """気圧面変数名を作成する"""
     return f"{short_name.upper()}{level}"
 
 def interpolate_grid_fast(data_values, src_lons, src_lats, target_lons, target_lats):
+    """
+    RectBivariateSplineを使用して高速に格子内挿を行う。
+    入力緯度は北から南、出力もそれに合わせる。
+    """
+    # 緯度を昇順にソート（南から北へ）
     src_lats_sorted = src_lats[::-1]
     data_values_sorted = data_values[::-1, :]
+    
+    # 補間関数を作成
     interp_func = RectBivariateSpline(src_lats_sorted, src_lons, data_values_sorted, kx=1, ky=1, s=0)
+    
+    # ターゲットの緯度も昇順にして補間を実行
     target_lats_sorted = target_lats[::-1]
     interp_values_sorted = interp_func(target_lats_sorted, target_lons, grid=True)
+    
+    # 結果を元の順序（北から南）に戻して返す
     return interp_values_sorted[::-1, :].astype(np.float32)
 
 def find_msm_files(base_time, msm_dir):
+    """指定された初期時刻に対応するGRIB2ファイル群を検索する"""
     file_paths = {}
     year_month = base_time.strftime('%Y%m')
     date_str_with_hour = base_time.strftime('%Y%m%d%H')
     file_template = "Z__C_RJTD_{datetime}0000_MSM_GPV_Rjp_{product}_{ft_str}_grib2.bin"
     
+    # Lsurf (地上) と L-pall (気圧面) ファイル
     for product_type in ['Lsurf', 'L-pall']:
         for ft in [3, 6]:
             key = f"{product_type}_ft{ft}"
@@ -105,7 +124,8 @@ def find_msm_files(base_time, msm_dir):
             path = Path(msm_dir) / year_month / file_template.format(datetime=date_str_with_hour, product=product_type, ft_str=ft_str)
             file_paths[key] = path if path.exists() else None
             
-    for ft_range in ["00-03", "03-06", "06-09"]:
+    # Prr (降水量) ファイル
+    for ft_range in ["00-03", "03-06"]:
         key = f"Prr_ft{ft_range}"
         ft_str = f"FH{ft_range}"
         path = Path(msm_dir) / year_month / file_template.format(datetime=date_str_with_hour, product="Prr", ft_str=ft_str)
@@ -114,11 +134,12 @@ def find_msm_files(base_time, msm_dir):
     return file_paths
 
 def process_grib_files(file_paths):
-    """GRIBファイルからデータを抽出し、辞書として返す（目的変数も含む）"""
+    """GRIBファイルからデータを抽出し、変数名をキーとする辞書として返す"""
     data_vars = {}
     try:
-        # --- 説明変数 ---
+        # --- 説明変数 (予報時間 ft=3, ft=6) ---
         for ft in [3, 6]:
+            # 地上データ (Lsurf)
             if (lsurf_path := file_paths.get(f"Lsurf_ft{ft}")):
                 with pygrib.open(str(lsurf_path)) as grbs:
                     for grb in grbs:
@@ -129,44 +150,63 @@ def process_grib_files(file_paths):
                             var_name = MEPS_SURFACE_LVL_VARS[(grb.shortName, grb.level)]
                             data_vars[f"{var_name}_ft{ft}"] = grb.values.astype(np.float32)
             
+            # 気圧面データ (L-pall)
             if (lpall_path := file_paths.get(f"L-pall_ft{ft}")):
                 with pygrib.open(str(lpall_path)) as grbs:
                     for grb in grbs:
                         if grb.level in MEPS_PRESSURE_SPEC and grb.shortName in MEPS_PRESSURE_SPEC[grb.level]:
                             var_name = get_pressure_var_name(grb.shortName, grb.level)
+                            # 地上格子に内挿
                             interp_data = interpolate_grid_fast(grb.values, MSM_P_LONS, MSM_P_LATS, MSM_S_LONS, MSM_S_LATS)
                             data_vars[f"{var_name}_ft{ft}"] = interp_data
         
         # --- 降水量 (説明変数) ---
+        # 0-3時間積算降水量
         if (prr_path := file_paths.get("Prr_ft00-03")):
             with pygrib.open(str(prr_path)) as grbs:
                 data_vars['Prec_ft3'] = np.sum([g.values for g in grbs], axis=0).astype(np.float32)
-        if (prr_path := file_paths.get("Prr_ft06-09")):
-            with pygrib.open(str(prr_path)) as grbs:
-                data_vars['Prec_6_9h_sum'] = np.sum([g.values for g in grbs], axis=0).astype(np.float32)
-
+        
         # --- 降水量 (説明変数 + 目的変数) ---
+        # 3-6時間データ
         if (prr_path := file_paths.get("Prr_ft03-06")):
             with pygrib.open(str(prr_path)) as grbs:
                 hourly_prec = {}
                 all_values = []
-                for grb in grbs:
+                # デバッグ: 各メッセージの情報を出力
+                logging.info(f"Processing precipitation file: {prr_path}")
+                for i, grb in enumerate(grbs):
+                    logging.info(f"Message {i}: forecastTime={grb.forecastTime}, "
+                               f"startStep={grb.startStep if hasattr(grb, 'startStep') else 'N/A'}, "
+                               f"endStep={grb.endStep if hasattr(grb, 'endStep') else 'N/A'}, "
+                               f"stepRange={grb.stepRange if hasattr(grb, 'stepRange') else 'N/A'}")
+                    
                     all_values.append(grb.values)
-                    if grb.forecastTime in [4, 5, 6]:
-                        hourly_prec[f'Prec_Target_ft{grb.forecastTime}'] = grb.values.astype(np.float32)
+                    
+                    # メッセージのインデックスで判断する方法
+                    if i == 0:  # 最初のメッセージ = 4時間目
+                        hourly_prec['Prec_Target_ft4'] = grb.values.astype(np.float32)
+                    elif i == 1:  # 2番目のメッセージ = 5時間目
+                        hourly_prec['Prec_Target_ft5'] = grb.values.astype(np.float32)
+                    elif i == 2:  # 3番目のメッセージ = 6時間目
+                        hourly_prec['Prec_Target_ft6'] = grb.values.astype(np.float32)
+                
+                # 説明変数として3-6時間積算降水量を保存
                 if all_values:
                     data_vars['Prec_4_6h_sum'] = np.sum(all_values, axis=0).astype(np.float32)
+                
                 data_vars.update(hourly_prec)
 
     except Exception as e:
-        logging.error(f"GRIB processing failed for files linked to {file_paths.get('Lsurf_ft3')}: {e}", exc_info=True)
+        logging.error(f"GRIB processing failed. file_paths: {file_paths}, error: {e}", exc_info=True)
         return {}
+        
     return data_vars
 
-def create_temporary_dataset(base_time, msm_dir, temp_dir):
-    """単一時刻のデータを処理し、一時的なNetCDFファイルとして保存する"""
+def process_single_time_to_dataset(base_time, msm_dir):
+    """単一時刻のGRIB群を処理し、メモリ上にxarray.Datasetを作成して返す"""
     file_paths = find_msm_files(base_time, msm_dir)
-    # 必須ファイルが一つでも欠けていたらスキップ
+    
+    # 課題で要求される必須ファイルが一つでも欠けていたらスキップ
     required_keys = ['Lsurf_ft3', 'Lsurf_ft6', 'L-pall_ft3', 'L-pall_ft6', 'Prr_ft00-03', 'Prr_ft03-06']
     if any(file_paths.get(key) is None for key in required_keys):
         logging.warning(f"Skipping {base_time}: Missing one or more required GRIB files.")
@@ -174,157 +214,102 @@ def create_temporary_dataset(base_time, msm_dir, temp_dir):
         
     data_vars_raw = process_grib_files(file_paths)
     if not data_vars_raw:
+        logging.warning(f"Skipping {base_time}: Data processing returned empty.")
         return None
 
-    output_path = Path(temp_dir) / f"{base_time.strftime('%Y%m%d%H')}.nc"
-    
     try:
         xds_vars = {}
-        temp_coords_da = xr.DataArray(dims=['lat', 'lon'], coords={'lat': MSM_S_LATS, 'lon': MSM_S_LONS})
-        final_lats = temp_coords_da.sel(lat=OUTPUT_LATS_SLICE).lat.values
-        final_lons = temp_coords_da.sel(lon=OUTPUT_LONS_SLICE).lon.values
-
+        # 生データから変数を抽出し、領域を切り出してxarray.DataArrayを作成
         for name, data in data_vars_raw.items():
-            ds_temp = xr.DataArray(data, dims=['lat', 'lon'], coords={'lat': MSM_S_LATS, 'lon': MSM_S_LONS})
-            cropped_data = ds_temp.sel(lat=OUTPUT_LATS_SLICE, lon=OUTPUT_LONS_SLICE).values
+            # 一旦フルサイズの座標でDataArrayを作成
+            da_full = xr.DataArray(data, dims=['lat', 'lon'], coords={'lat': MSM_S_LATS, 'lon': MSM_S_LONS})
+            # 目的の領域を切り出し
+            cropped_data = da_full.sel(lat=OUTPUT_LATS_SLICE, lon=OUTPUT_LONS_SLICE).values
+            # time次元を追加して格納
             xds_vars[name] = (['time', 'lat', 'lon'], np.expand_dims(cropped_data, axis=0))
         
+        # この時刻のDatasetを作成
         ds = xr.Dataset(
             data_vars=xds_vars,
-            coords={'time': pd.to_datetime([base_time]), 'lat': final_lats, 'lon': final_lons}
+            coords={'time': pd.to_datetime([base_time]), 'lat': OUTPUT_LATS, 'lon': OUTPUT_LONS}
         )
-        ds.to_netcdf(output_path, engine='h5netcdf')
-        return str(output_path)
+        return ds
     except Exception as e:
-        logging.error(f"Failed to create temp NetCDF for {base_time}: {e}", exc_info=True)
+        logging.error(f"Failed to create xarray.Dataset for {base_time}: {e}", exc_info=True)
         return None
 
-def run_parallel_processing(base_times, msm_dir, temp_dir, max_workers, desc):
-    """並列処理を実行し、生成された一時ファイルのリストを返す"""
-    temp_files = []
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-        future_to_time = {executor.submit(create_temporary_dataset, bt, msm_dir, temp_dir): bt for bt in base_times}
-        
-        with tqdm(total=len(base_times), desc=desc) as pbar:
-            for future in concurrent.futures.as_completed(future_to_time):
-                try:
-                    result_path = future.result()
-                    if result_path is not None:
-                        temp_files.append(result_path)
-                except Exception as e:
-                    logging.error(f"A worker process failed: {e}", exc_info=True)
-                pbar.update(1)
-    return temp_files
-
-def calc_stats():
-    """データセット全体の平均と標準偏差を計算し、ファイルに保存する"""
-    logging.info("--- Running in [calc_stats] mode ---")
-    start_time = time.time()
-    
-    # 一時ディレクトリを作成
-    temp_dir = Path(tempfile.mkdtemp(prefix="stats_calc_", dir=TEMP_ROOT_DIR))
-    logging.info(f"Created temporary directory for stats calculation: {temp_dir}")
-    
-    try:
-        start_date = f"{TRAIN_START_YEAR}-01-01"
-        end_date = f"{TRAIN_END_YEAR}-12-31"
-        date_range = pd.date_range(start=start_date, end=end_date, freq='D')
-        base_times = [d + pd.Timedelta(hours=h) for d in date_range for h in range(0, 24, 3)]
-
-        desc = f"Creating temp files for stats ({TRAIN_START_YEAR}-{TRAIN_END_YEAR})"
-        temp_files = run_parallel_processing(base_times, MSM_DIR, temp_dir, MAX_WORKERS, desc)
-
-        if not temp_files:
-            logging.error("No temporary files were created. Cannot calculate statistics.")
-            return
-
-        logging.info(f"Calculating statistics from {len(temp_files)} files...")
-        with xr.open_mfdataset(sorted(temp_files), engine='h5netcdf', combine='by_coords', parallel=True) as ds:
-            means = ds.mean('time').compute()
-            stds = ds.std('time').compute()
-            
-            stats_ds = xr.Dataset()
-            for var in ds.data_vars:
-                stats_ds[f'{var}_mean'] = means[var]
-                stats_ds[f'{var}_std'] = stds[var]
-            
-            STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            stats_ds.to_netcdf(STATS_FILE)
-            logging.info(f"Statistics saved to: {STATS_FILE}")
-            logging.info(f"\n[Statistics Dataset Info]\n{stats_ds}")
-
-    finally:
-        # ★★★ 修正点1 ★★★
-        # if temp_dir.exists():
-        #     shutil.rmtree(temp_dir)
-        #     logging.info(f"Removed temporary directory: {temp_dir}")
-        logging.info(f"Kept temporary directory for stats: {temp_dir}")
-    logging.info(f"Finished [calc_stats] mode in {time.time() - start_time:.2f} seconds.")
-
-def convert_monthly_data(year, month, stats_ds):
-    """指定された年月のデータを標準化し、月次ファイルとして保存する"""
+def convert_monthly_data(year, month, msm_dir, output_dir, max_workers):
+    """指定された年月のデータを変換し、月次NetCDFファイルとして保存する"""
     month_start_time = time.time()
     logging.info(f"--- Starting conversion for {year}-{month:02d} ---")
     
-    output_file = OUTPUT_DIR / f"{year}{month:02d}.nc"
+    output_file = output_dir / f"{year}{month:02d}.nc"
     if output_file.exists():
         logging.info(f"File {output_file} already exists. Skipping.")
         return
-        
-    temp_dir = Path(tempfile.mkdtemp(prefix=f"convert_{year}_{month:02d}_", dir=TEMP_ROOT_DIR))
-    logging.info(f"Created temporary directory for conversion: {temp_dir}")
+
+    # --- 1. 月内の全時刻について並列処理でデータセットを作成 ---
+    logging.info("Starting parallel processing to create in-memory datasets...")
+    t_start_parallel = time.time()
     
-    try:
-        start_date = f"{year}-{month:02d}-01"
-        # end_dateの計算
-        if month == 12:
-            end_date = pd.to_datetime(f"{year}-12-31")
-        else:
-            end_date = pd.to_datetime(f"{year}-{month+1:02d}-01") - pd.Timedelta(days=1)
-        
-        date_range = pd.date_range(start=start_date, end=end_date, freq='D')
-        base_times = [d + pd.Timedelta(hours=h) for d in date_range for h in range(0, 24, 3)]
-
-        desc = f"Processing data for {year}-{month:02d}"
-        temp_files = run_parallel_processing(base_times, MSM_DIR, temp_dir, MAX_WORKERS, desc)
-        
-        if not temp_files:
-            logging.warning(f"No data was processed for {year}-{month:02d}. Skipping file creation.")
-            return
-
-        logging.info(f"Concatenating and standardizing {len(temp_files)} files for {year}-{month:02d}...")
-        with xr.open_mfdataset(sorted(temp_files), engine='h5netcdf', combine='by_coords', parallel=True, chunks={'time': 10}) as ds:
-            standardized_ds = xr.Dataset(coords=ds.coords)
-            for var in ds.data_vars:
-                if f'{var}_mean' in stats_ds and f'{var}_std' in stats_ds:
-                    mean = stats_ds[f'{var}_mean']
-                    std = stats_ds[f'{var}_std']
-                    standardized_ds[var] = xr.where(std > 1e-9, (ds[var] - mean) / std, 0)
-                else:
-                    logging.warning(f"Stats for '{var}' not found. Data will not be standardized.")
-                    standardized_ds[var] = ds[var]
-
-            time_coord = standardized_ds.coords['time']
-            standardized_ds['dayofyear_sin'] = (('time',), np.sin(2 * np.pi * time_coord.dt.dayofyear / 366.0).data)
-            standardized_ds['dayofyear_cos'] = (('time',), np.cos(2 * np.pi * time_coord.dt.dayofyear / 366.0).data)
-            standardized_ds['hour_sin'] = (('time',), np.sin(2 * np.pi * time_coord.dt.hour / 24.0).data)
-            standardized_ds['hour_cos'] = (('time',), np.cos(2 * np.pi * time_coord.dt.hour / 24.0).data)
+    start_date = f"{year}-{month:02d}-01"
+    end_date_dt = pd.to_datetime(start_date) + pd.offsets.MonthEnd(0)
+    date_range = pd.date_range(start=start_date, end=end_date_dt, freq='D')
+    base_times = [d + pd.Timedelta(hours=h) for d in date_range for h in range(0, 24, 3)]
+    
+    datasets_in_month = []
+    desc = f"Processing data for {year}-{month:02d}"
+    
+    with tqdm(total=len(base_times), desc=desc, file=os.sys.stderr, dynamic_ncols=True) as pbar:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_to_time = {executor.submit(process_single_time_to_dataset, bt, msm_dir): bt for bt in base_times}
             
-            logging.info(f"Saving final NetCDF file to {output_file}...")
-            encoding = {var: {'zlib': True, 'complevel': 5} for var in standardized_ds.data_vars}
-            write_job = standardized_ds.to_netcdf(output_file, encoding=encoding, mode='w', engine='h5netcdf', compute=False)
-            with ProgressBar():
-                write_job.compute()
-            logging.info(f"Successfully created {output_file}.")
+            for future in concurrent.futures.as_completed(future_to_time):
+                try:
+                    result_ds = future.result()
+                    if result_ds is not None:
+                        datasets_in_month.append(result_ds)
+                except Exception as e:
+                    logging.error(f"A worker process failed for {future_to_time[future]}: {e}", exc_info=True)
+                pbar.update(1)
+                
+    logging.info(f"Finished parallel processing. Time taken: {time.time() - t_start_parallel:.2f} seconds.")
+    
+    if not datasets_in_month:
+        logging.warning(f"No data was processed for {year}-{month:02d}. Skipping file creation.")
+        return
 
-    finally:
-        # ★★★ 修正点2 ★★★
-        # if temp_dir.exists():
-        #     shutil.rmtree(temp_dir)
-        #     logging.info(f"Removed temporary directory: {temp_dir}")
-        logging.info(f"Kept temporary directory for conversion: {temp_dir}")
+    # --- 2. データセット結合と時間特徴量追加 ---
+    logging.info(f"Concatenating {len(datasets_in_month)} datasets for {year}-{month:02d}...")
+    t_start_concat = time.time()
+    
+    # 時刻順にソートしてから結合
+    datasets_in_month.sort(key=lambda ds: ds.time.values[0])
+    monthly_ds = xr.concat(datasets_in_month, dim='time')
+    
+    logging.info(f"  - Concatenation completed. Time taken: {time.time() - t_start_concat:.2f} seconds.")
+
+    # 時間特徴量を追加
+    t_start_features = time.time()
+    time_coord = monthly_ds.coords['time']
+    monthly_ds['dayofyear_sin'] = np.sin(2 * np.pi * time_coord.dt.dayofyear / 366.0).astype(np.float32)
+    monthly_ds['dayofyear_cos'] = np.cos(2 * np.pi * time_coord.dt.dayofyear / 366.0).astype(np.float32)
+    monthly_ds['hour_sin']      = np.sin(2 * np.pi * time_coord.dt.hour / 24.0).astype(np.float32)
+    monthly_ds['hour_cos']      = np.cos(2 * np.pi * time_coord.dt.hour / 24.0).astype(np.float32)
+    logging.info(f"  - Adding time features completed. Time taken: {time.time() - t_start_features:.2f} seconds.")
+    
+    # --- 3. ファイル保存 ---
+    logging.info(f"Saving final NetCDF file to {output_file}...")
+    t_start_save = time.time()
+    encoding = {var: {'zlib': True, 'complevel': 5} for var in monthly_ds.data_vars}
+    write_job = monthly_ds.to_netcdf(output_file, encoding=encoding, mode='w', engine='h5netcdf', compute=False)
+    
+    with ProgressBar():
+        write_job.compute()
+        
+    logging.info(f"  - Saving to NetCDF completed. Time taken: {time.time() - t_start_save:.2f} seconds.")
+    logging.info(f"Successfully created {output_file}.")
     logging.info(f"Finished conversion for {year}-{month:02d} in {time.time() - month_start_time:.2f} seconds.")
-
 
 # ==============================================================================
 # --- メイン実行部 ---
@@ -337,25 +322,10 @@ def main():
     
     # --- ディレクトリ作成 ---
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    TEMP_ROOT_DIR.mkdir(parents=True, exist_ok=True)
-    logging.info(f"Output directory: {OUTPUT_DIR}")
-    logging.info(f"Temporary directory: {TEMP_ROOT_DIR}")
+    logging.info(f"Input GRIB2 directory: {MSM_DIR}")
+    logging.info(f"Output NetCDF directory: {OUTPUT_DIR}")
 
-    # --- 1. 統計量計算 ---
-    if not STATS_FILE.exists():
-        logging.info("Statistics file not found. Starting statistics calculation...")
-        calc_stats()
-    else:
-        logging.info(f"Statistics file found at {STATS_FILE}. Skipping calculation.")
-    
-    try:
-        stats_ds = xr.open_dataset(STATS_FILE)
-        logging.info("Successfully loaded statistics file.")
-    except Exception as e:
-        logging.error(f"Could not load statistics file: {e}. Please delete it and run again.", exc_info=True)
-        return
-
-    # --- 2. データ変換 (月次) ---
+    # --- データ変換 (月次) ---
     logging.info(f"--- Running in [convert] mode for {START_YEAR} to {END_YEAR} ---")
     
     total_months = (END_YEAR - START_YEAR + 1) * 12
@@ -365,19 +335,20 @@ def main():
     for year in range(START_YEAR, END_YEAR + 1):
         for month in range(1, 13):
             processed_months += 1
-            logging.info(f"--- Processing month {processed_months} of {total_months} ---")
+            logging.info(f"--- Processing month {processed_months} of {total_months} ({year}-{month:02d}) ---")
             
-            convert_monthly_data(year, month, stats_ds)
+            convert_monthly_data(year, month, MSM_DIR, OUTPUT_DIR, MAX_WORKERS)
             
             # --- 進捗報告 ---
             elapsed_time = time.time() - conversion_start_time
-            avg_time_per_month = elapsed_time / processed_months
-            remaining_months = total_months - processed_months
-            estimated_time_remaining = avg_time_per_month * remaining_months
-            
-            logging.info(f"Progress: {processed_months}/{total_months} months complete.")
-            logging.info(f"Elapsed time: {datetime.timedelta(seconds=int(elapsed_time))}")
-            logging.info(f"Estimated time remaining: {datetime.timedelta(seconds=int(estimated_time_remaining))}")
+            if processed_months > 0:
+                avg_time_per_month = elapsed_time / processed_months
+                remaining_months = total_months - processed_months
+                estimated_time_remaining = avg_time_per_month * remaining_months
+                
+                logging.info(f"Progress: {processed_months}/{total_months} months complete.")
+                logging.info(f"Elapsed time: {datetime.timedelta(seconds=int(elapsed_time))}")
+                logging.info(f"Estimated time remaining: {datetime.timedelta(seconds=int(estimated_time_remaining))}")
             
     total_elapsed = time.time() - total_start_time
     logging.info(f"===== All processes finished. Total execution time: {datetime.timedelta(seconds=int(total_elapsed))} =====")

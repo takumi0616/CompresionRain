@@ -360,7 +360,7 @@ def main():
             print(f"エラー: {target} が見つかりません")
     else:
         # デフォルトパスでチェック
-        default_dir = "MSM_data_nc"
+        default_dir = "output_nc"
         if os.path.exists(default_dir):
             # 201801のデータをサンプルとしてチェック
             check_all_files(default_dir, "201801")
