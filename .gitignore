@@ -5,3 +5,4 @@ __pycache__/
 MSM_data/
 output_nc/
 *.log
+trash/
