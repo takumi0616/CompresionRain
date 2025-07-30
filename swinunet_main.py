@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# gemini_main.py
+# swinunet_main.py (月次データ対応版)
 
 import os
+import glob
 import warnings
 
 import matplotlib.pyplot as plt
@@ -23,17 +24,34 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ==============================================================================
-# 1. 設定 & ハイパーパラメータ
+# 1. 設定 & ハイパーパラメータ ★★★ 修正箇所 ★★★
 # ==============================================================================
 # --- データパス設定 ---
-# 学習に使用するNetCDFファイル (複数年指定可能)
-TRAIN_FILES = ['./output_nc/2018.nc', './output_nc/2019.nc', './output_nc/2020.nc', './output_nc/2021.nc']
-# 検証に使用するNetCDFファイル
-VALID_FILE = ['./output_nc/2022.nc']
+# NetCDFファイルが格納されているディレクトリ
+DATA_DIR = './output_nc'
+# 学習に使用する年リスト
+TRAIN_YEARS = [2018, 2019, 2020, 2021]
+# 検証に使用する年リスト
+VALID_YEARS = [2022]
+
+# 指定された年の月次ファイルパスを動的に生成
+def get_monthly_files(data_dir, years):
+    """指定された年の全ての月次NetCDFファイルのリストを取得する"""
+    files = []
+    for year in years:
+        # globを使って YYYY01.nc, YYYY02.nc, ..., YYYY12.nc という形式のファイルを検索
+        files.extend(sorted(glob.glob(os.path.join(data_dir, f'{year}*.nc'))))
+    if not files:
+        print(f"警告: {years}年のファイルが'{data_dir}'に見つかりませんでした。")
+    return files
+
+TRAIN_FILES = get_monthly_files(DATA_DIR, TRAIN_YEARS)
+VALID_FILES = get_monthly_files(DATA_DIR, VALID_YEARS) # 変数名を複数形に変更
+
 # モデルやプロットの保存先
-MODEL_SAVE_PATH = 'best_swin_unet_model_ddp.pth'
-PLOT_SAVE_PATH = 'loss_curve.png'
-RESULT_IMG_DIR = 'result_images' # 結果画像の保存ディレクトリ
+MODEL_SAVE_PATH = 'best_swin_unet_model_ddp_monthly.pth'
+PLOT_SAVE_PATH = 'loss_curve_monthly.png'
+RESULT_IMG_DIR = 'result_images_monthly' # 結果画像の保存ディレクトリ
 
 # --- 学習パラメータ ---
 # 各GPUあたりのバッチサイズ (合計バッチサイズは BATCH_SIZE * WORLD_SIZE)
@@ -50,15 +68,16 @@ NUM_CLASSES = 3
 
 # --- 変数定義 ---
 # モデルの入力に使用する変数リスト (FT=3, FT=6)
-# `Prec` は特別扱いするため、このリストからは除外
 INPUT_VARS_COMMON = [
     'Prmsl', 'U10m', 'V10m', 'T2m', 'U975', 'V975', 'T975',
     'U950', 'V950', 'T950', 'U925', 'V925', 'T925', 'R925',
     'U850', 'V850', 'T850', 'R850', 'GH500', 'T500', 'R500',
     'GH300', 'U300', 'V300'
 ]
-# 入力に使用する降水量変数
-INPUT_VARS_PREC = ['Prec_ft3', 'Prec_4_6h_sum', 'Prec_6_9h_sum']
+# 入力に使用する降水量変数 (FT=3までの実績値のみ)
+# Prec_4_6h_sum は目的変数の一部、Prec_6_9h_sum は未来情報のため入力から除外
+INPUT_VARS_PREC = ['Prec_ft3']
+
 # 時間特徴量
 TIME_VARS = ['dayofyear_sin', 'dayofyear_cos', 'hour_sin', 'hour_cos']
 
@@ -70,13 +89,12 @@ TARGET_VAR_SUM = 'Prec_4_6h_sum'
 IN_CHANS = len(INPUT_VARS_COMMON) * 2 + len(INPUT_VARS_PREC) + len(TIME_VARS)
 
 # ==============================================================================
-# 2. DDPセットアップ / クリーンアップ関数
+# 2. DDPセットアップ / クリーンアップ関数 (変更なし)
 # ==============================================================================
 def setup_ddp(rank, world_size):
     """DDPのためのプロセスグループを初期化"""
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'  # 任意の空きポート
-    # backendはNVIDIA GPUなら'nccl'が最速
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
 def cleanup_ddp():
@@ -84,7 +102,7 @@ def cleanup_ddp():
     dist.destroy_process_group()
 
 # ==============================================================================
-# 3. データセットクラスの定義 ★★★ 課題解決のための修正箇所 ★★★
+# 3. データセットクラスの定義 (変更なし)
 # ==============================================================================
 class NetCDFDataset(Dataset):
     """
@@ -93,7 +111,8 @@ class NetCDFDataset(Dataset):
     """
     def __init__(self, file_paths):
         super().__init__()
-        self.ds = xr.open_mfdataset(file_paths, chunks={}, parallel=True)
+        # open_mfdataset はファイルパスのリストをそのまま扱えるため、ここの修正は不要
+        self.ds = xr.open_mfdataset(file_paths, chunks={}, parallel=True, combine='by_coords')
         self.time_len = len(self.ds['time'])
         self.img_dims = (self.ds.sizes['lat'], self.ds.sizes['lon'])
 
@@ -108,12 +127,10 @@ class NetCDFDataset(Dataset):
         input_channels = []
         # FT=3とFT=6の共通変数を追加
         for var in INPUT_VARS_COMMON:
-            # FT=3
             input_channels.append(np.nan_to_num(sample[f'{var}_ft3'].values))
-            # FT=6
             input_channels.append(np.nan_to_num(sample[f'{var}_ft6'].values))
 
-        # 降水量変数を追加
+        # 降水量変数を追加 (変数リストの変更がここで反映される)
         for var in INPUT_VARS_PREC:
             input_channels.append(np.nan_to_num(sample[var].values))
 
@@ -141,38 +158,39 @@ class NetCDFDataset(Dataset):
         }
 
 # ==============================================================================
-# 4. 損失関数、学習・可視化関数 ★★★ 課題解決のための修正箇所 ★★★
+# 4. 損失関数、学習・可視化関数 (★★★ 修正 ★★★)
 # ==============================================================================
-def rmse_loss(pred, target):
-    """単純なRMSEを計算するヘルパー関数"""
-    return torch.sqrt(nn.functional.mse_loss(pred, target))
+# def rmse_loss(pred, target): # このヘルパー関数は不要なため削除
 
 def custom_loss_function(output, targets):
     """
     課題仕様に準拠した複合損失関数。
-    - L1: 1時間ごとの降水量に対するRMSE
-    - L2: 3時間積算降水量に対するRMSE
-    - Total Loss = L1 + L2
+    - 損失の計算には数値的に安定なMSEを使用し、報告用にRMSEを別途計算します。
+    - Total Loss = MSE_1h + MSE_sum
     """
-    # モデル出力は負の値を取りうるため、物理的にありえない負の降水量を0に補正
     output = torch.relu(output)
-
-    # --- L1: 1時間ごとのRMSE ---
     target_1h = targets['target_1h']
-    loss_1h_rmse = rmse_loss(output, target_1h)
 
-    # --- L2: 3時間積算のRMSE ---
+    # --- 勾配計算に使われる損失 (MSE) ---
+    loss_1h_mse = nn.functional.mse_loss(output, target_1h)
+
     predicted_sum = torch.sum(output, dim=1, keepdim=True)
     target_sum = targets['target_sum']
-    loss_sum_rmse = rmse_loss(predicted_sum, target_sum)
+    loss_sum_mse = nn.functional.mse_loss(predicted_sum, target_sum)
 
-    # --- Total Loss ---
-    total_loss = loss_1h_rmse + loss_sum_rmse
-    
-    # 損失の内訳も返すことで、学習状況のモニタリングを容易にする
-    return total_loss, loss_1h_rmse, loss_sum_rmse
+    # MSEを合計したものを最終的な損失として逆伝播させる
+    total_loss = loss_1h_mse + loss_sum_mse
 
-def train_one_epoch(rank, model, dataloader, optimizer, scaler):
+    # --- 報告・表示用の指標 (RMSE) ---
+    # 勾配計算を無効化して、発散のリスクなしにRMSEを計算
+    with torch.no_grad():
+        rmse_1h = torch.sqrt(loss_1h_mse)
+        rmse_sum = torch.sqrt(loss_sum_mse)
+
+    # 戻り値の構造は同じ (total_loss, metric1, metric2)
+    return total_loss, rmse_1h, rmse_sum
+
+def train_one_epoch(rank, model, dataloader, optimizer, scaler, epoch):
     """1エポック分の学習処理"""
     model.train()
     total_loss, total_1h_rmse, total_sum_rmse = 0.0, 0.0, 0.0
@@ -201,14 +219,13 @@ def train_one_epoch(rank, model, dataloader, optimizer, scaler):
         if rank == 0:
             progress_bar.set_postfix(loss=loss.item(), rmse_1h=loss_1h.item(), rmse_sum=loss_sum.item())
             
-    # 全プロセスで平均損失を集計
     avg_loss = torch.tensor([total_loss, total_1h_rmse, total_sum_rmse], device=rank) / len(dataloader)
     dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
     
     return avg_loss.cpu().numpy()
 
 @torch.no_grad()
-def validate_one_epoch(rank, model, dataloader):
+def validate_one_epoch(rank, model, dataloader, epoch):
     """1エポック分の検証処理"""
     model.eval()
     total_loss, total_1h_rmse, total_sum_rmse = 0.0, 0.0, 0.0
@@ -237,37 +254,34 @@ def validate_one_epoch(rank, model, dataloader):
 def visualize_results(rank, model, dataloader, epoch, num_samples=2):
     """学習結果を可視化して画像ファイルとして保存"""
     model.eval()
-    # 最初のバッチを取得
     batch = next(iter(dataloader))
     inputs = batch['input'][:num_samples].to(rank)
     targets_1h = batch['target_1h'][:num_samples]
     targets_sum = batch['target_sum'][:num_samples]
 
     with autocast(device_type='cuda', dtype=torch.float16):
+        # DDPでラップされているため .module にアクセス
         outputs = model.module(inputs)
     outputs = torch.relu(outputs).cpu()
     
-    # 3時間積算値を計算
     outputs_sum = outputs.sum(dim=1, keepdim=True)
-    
     os.makedirs(RESULT_IMG_DIR, exist_ok=True)
 
     for i in range(num_samples):
         fig, axes = plt.subplots(3, 4, figsize=(20, 15))
         fig.suptitle(f'Epoch {epoch+1} - Sample {i+1} on GPU {rank}', fontsize=18)
         
-        # 共通のカラーマップと最大値
         prec_max = max(targets_sum[i].max(), outputs_sum[i].max(), 1.0)
         
-        # --- Row 0: 入力と積算値の比較 ---
+        # --- 入力代表と積算値の比較 ---
         ax = axes[0, 0]
         im = ax.imshow(inputs[i, 0].cpu().numpy(), cmap='viridis') # Prmsl_ft3
         ax.set_title('Input: Prmsl_ft3')
         fig.colorbar(im, ax=ax, shrink=0.8)
 
         ax = axes[0, 1]
-        im = ax.imshow(inputs[i, 1].cpu().numpy(), cmap='viridis') # Prmsl_ft6
-        ax.set_title('Input: Prmsl_ft6')
+        im = ax.imshow(inputs[i, 24 * 2].cpu().numpy(), cmap='jet') # Prec_ft3
+        ax.set_title('Input: Prec_ft3')
         fig.colorbar(im, ax=ax, shrink=0.8)
 
         ax = axes[0, 2]
@@ -280,25 +294,23 @@ def visualize_results(rank, model, dataloader, epoch, num_samples=2):
         ax.set_title(f'Prediction Sum: {outputs_sum[i].sum():.2f} mm')
         fig.colorbar(im, ax=ax, shrink=0.8)
 
-        # --- Row 1 & 2: 1時間ごとの比較 ---
+        # --- 1時間ごとの比較 ---
         for ft_idx in range(3):
             ft = ft_idx + 4
             target_img = targets_1h[i, ft_idx]
             pred_img = outputs[i, ft_idx]
             
-            # Target
             ax = axes[1, ft_idx]
-            im = ax.imshow(target_img, cmap='Blues', vmin=0, vmax=prec_max/2)
+            im = ax.imshow(target_img, cmap='Blues', vmin=0, vmax=max(1.0, prec_max/2))
             ax.set_title(f'Target FT={ft} ({target_img.sum():.2f} mm)')
             fig.colorbar(im, ax=ax, shrink=0.8)
             
-            # Prediction
             ax = axes[2, ft_idx]
-            im = ax.imshow(pred_img, cmap='Blues', vmin=0, vmax=prec_max/2)
+            im = ax.imshow(pred_img, cmap='Blues', vmin=0, vmax=max(1.0, prec_max/2))
             ax.set_title(f'Prediction FT={ft} ({pred_img.sum():.2f} mm)')
             fig.colorbar(im, ax=ax, shrink=0.8)
 
-        # エラーマップ
+        # --- エラーマップ ---
         ax = axes[2, 3]
         error_map = outputs_sum[i, 0] - targets_sum[i, 0]
         err_max = torch.abs(error_map).max()
@@ -313,19 +325,19 @@ def visualize_results(rank, model, dataloader, epoch, num_samples=2):
 def plot_loss_curve(history, save_path):
     """損失曲線をプロットして保存"""
     plt.figure(figsize=(12, 8))
-    epochs = range(1, len(history['train_loss']) + 1)
+    epochs_range = range(1, len(history['train_loss']) + 1)
     
     plt.subplot(2, 1, 1)
-    plt.plot(epochs, history['train_loss'], 'bo-', label='Training Total Loss')
-    plt.plot(epochs, history['val_loss'], 'ro-', label='Validation Total Loss')
+    plt.plot(epochs_range, history['train_loss'], 'bo-', label='Training Total Loss')
+    plt.plot(epochs_range, history['val_loss'], 'ro-', label='Validation Total Loss')
     plt.title('Total Loss Curve')
     plt.ylabel('Loss (RMSE_1h + RMSE_sum)')
     plt.legend()
     plt.grid(True)
     
     plt.subplot(2, 2, 3)
-    plt.plot(epochs, history['train_1h_rmse'], 'b.-', label='Train 1h-RMSE')
-    plt.plot(epochs, history['val_1h_rmse'], 'r.-', label='Val 1h-RMSE')
+    plt.plot(epochs_range, history['train_1h_rmse'], 'b.-', label='Train 1h-RMSE')
+    plt.plot(epochs_range, history['val_1h_rmse'], 'r.-', label='Val 1h-RMSE')
     plt.title('1-hour RMSE')
     plt.xlabel('Epoch')
     plt.ylabel('RMSE')
@@ -333,8 +345,8 @@ def plot_loss_curve(history, save_path):
     plt.grid(True)
     
     plt.subplot(2, 2, 4)
-    plt.plot(epochs, history['train_sum_rmse'], 'b.--', label='Train Sum-RMSE')
-    plt.plot(epochs, history['val_sum_rmse'], 'r.--', label='Val Sum-RMSE')
+    plt.plot(epochs_range, history['train_sum_rmse'], 'b.--', label='Train Sum-RMSE')
+    plt.plot(epochs_range, history['val_sum_rmse'], 'r.--', label='Val Sum-RMSE')
     plt.title('Sum RMSE')
     plt.xlabel('Epoch')
     plt.ylabel('RMSE')
@@ -355,24 +367,25 @@ def main_worker(rank, world_size):
     if rank == 0:
         print(f"INFO: Running DDP on {world_size} GPUs. Total batch size: {BATCH_SIZE * world_size}")
         print(f"INFO: Input channels: {IN_CHANS}")
+        print(f"INFO: Found {len(TRAIN_FILES)} training files.")
+        print(f"INFO: Found {len(VALID_FILES)} validation files.")
 
     # --- データセットとデータローダー ---
     train_dataset = NetCDFDataset(TRAIN_FILES)
-    valid_dataset = NetCDFDataset(VALID_FILE)
+    valid_dataset = NetCDFDataset(VALID_FILES)
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     valid_sampler = DistributedSampler(valid_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True, sampler=train_sampler)
-    valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True, sampler=valid_sampler)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True, sampler=train_sampler)
+    valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True, sampler=valid_sampler)
 
     # --- モデル ---
     model = SwinTransformerSys(
         img_size=IMG_SIZE, patch_size=PATCH_SIZE, in_chans=IN_CHANS, num_classes=NUM_CLASSES,
-        embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=7, # Window size is often 7
+        embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=15,
         mlp_ratio=4., qkv_bias=True, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
         norm_layer=nn.LayerNorm, ape=False, patch_norm=True, use_checkpoint=False
     ).to(rank)
     
-    # torch.compile -> DDP ラップ
     model = torch.compile(model, mode="reduce-overhead")
     model = DDP(model, device_ids=[rank], find_unused_parameters=False)
     
@@ -389,13 +402,10 @@ def main_worker(rank, world_size):
         'val_loss': [], 'val_1h_rmse': [], 'val_sum_rmse': []
     }
     
-    global epoch
     for epoch in range(NUM_EPOCHS):
+        train_losses = train_one_epoch(rank, model, train_loader, optimizer, scaler, epoch)
+        val_losses = validate_one_epoch(rank, model, valid_loader, epoch)
         
-        train_losses = train_one_epoch(rank, model, train_loader, optimizer, scaler)
-        val_losses = validate_one_epoch(rank, model, valid_loader)
-        
-        # 損失を履歴に保存
         loss_history['train_loss'].append(train_losses[0])
         loss_history['train_1h_rmse'].append(train_losses[1])
         loss_history['train_sum_rmse'].append(train_losses[2])
@@ -408,13 +418,11 @@ def main_worker(rank, world_size):
             print(f"Train Loss: {train_losses[0]:.4f} (1h: {train_losses[1]:.4f}, sum: {train_losses[2]:.4f})")
             print(f"Valid Loss: {val_losses[0]:.4f} (1h: {val_losses[1]:.4f}, sum: {val_losses[2]:.4f})")
             
-            # 最良モデルの保存
             if val_losses[0] < best_val_loss:
                 best_val_loss = val_losses[0]
                 torch.save(model.module.state_dict(), MODEL_SAVE_PATH)
                 print(f"INFO: Saved best model with validation loss: {best_val_loss:.4f}")
             
-            # 定期的に可視化を実行 (例: 5エポックごとと最終エポック)
             if (epoch + 1) % 5 == 0 or (epoch + 1) == NUM_EPOCHS:
                 print("INFO: Visualizing results...")
                 visualize_results(rank, model, valid_loader, epoch, num_samples=2)
@@ -429,19 +437,22 @@ def main_worker(rank, world_size):
     cleanup_ddp()
 
 # ==============================================================================
-# 6. メイン実行ブロック
+# 6. メイン実行ブロック (変更なし)
 # ==============================================================================
 if __name__ == '__main__':
-    world_size = torch.cuda.device_count()
-    if world_size > 1:
-        print(f"Found {world_size} GPUs. Launching DDP.")
-        mp.spawn(main_worker,
-                 args=(world_size,),
-                 nprocs=world_size,
-                 join=True)
-    elif world_size == 1:
-        print("Found 1 GPU. Running in single-GPU mode.")
-        # DDPのセットアップを簡略化してシングルプロセスで実行
-        main_worker(0, 1)
+    # 実行前に学習/検証ファイルが存在するか確認
+    if not TRAIN_FILES or not VALID_FILES:
+        print("ERROR: Training or validation files not found. Please check DATA_DIR and YEAR settings.")
     else:
-        print("ERROR: No GPU found. This script requires at least one GPU.")
+        world_size = torch.cuda.device_count()
+        if world_size > 1:
+            print(f"Found {world_size} GPUs. Launching DDP.")
+            mp.spawn(main_worker,
+                     args=(world_size,),
+                     nprocs=world_size,
+                     join=True)
+        elif world_size == 1:
+            print("Found 1 GPU. Running in single-GPU mode.")
+            main_worker(0, 1)
+        else:
+            print("ERROR: No GPU found. This script requires at least one GPU.")

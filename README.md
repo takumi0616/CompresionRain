@@ -1,5 +1,5 @@
 ```bash
-nohup python gemini_main.py > output.log 2>&1 &
+nohup python swinunet_main.py > swinunet_main.log 2>&1 &
 
 nohup python3 check_data.py > check_data.log 2>&1 &
 
@@ -14,7 +14,7 @@ nohup python3 check_MSM_data_nc.py > check_MSM_data_nc.log 2>&1 &
 タスクの削除
 
 ```bash
-pkill -f "python gemini_main.py"
+pkill -f "swinunet_main.py"
 
 pkill -f "convert_data_v1.py"
 

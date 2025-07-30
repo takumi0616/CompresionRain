@@ -22,7 +22,7 @@ from dask.diagnostics import ProgressBar
 START_YEAR = 2018
 END_YEAR = 2023
 
-# 並列処理ワーカー数 (マシンのCPUコア数に合わせて調整)
+# 並列処理ワーカー数 (マシンのCPUコア数に合わせて調整)gpu01:22, gpu02:44
 MAX_WORKERS = 22
 
 # --- パス設定 ---
@@ -308,7 +308,20 @@ def convert_monthly_data(year, month, msm_dir, output_dir, max_workers):
     # --- 3. 月次ファイルとしてディスクに保存 ---
     logging.info(f"Step 3: Saving the final monthly NetCDF file to {output_file}...")
     t_start_save = time.time()
-    encoding = {var: {'zlib': True, 'complevel': 5} for var in monthly_ds.data_vars}
+
+    # チャンクサイズを設定（time=1, lat=全体, lon=全体）
+    chunk_sizes = {'time': 1, 'lat': len(OUTPUT_LATS), 'lon': len(OUTPUT_LONS)}
+    monthly_ds = monthly_ds.chunk(chunk_sizes)
+
+    # エンコーディング設定（圧縮とチャンクの両方を指定）
+    encoding = {}
+    for var in monthly_ds.data_vars:
+        encoding[var] = {
+            'zlib': True, 
+            'complevel': 5,
+            'chunksizes': (1, len(OUTPUT_LATS), len(OUTPUT_LONS)) if monthly_ds[var].ndim == 3 else None
+        }
+
     write_job = monthly_ds.to_netcdf(output_file, encoding=encoding, mode='w', engine='h5netcdf', compute=False)
     
     with ProgressBar():
