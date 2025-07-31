@@ -1,6 +1,8 @@
 ```bash
 nohup python swinunet_main.py > swinunet_main.log 2>&1 &
 
+nohup python optimization_nc_data.py > optimization_nc_data.log 2>&1 &
+
 nohup python3 check_data.py > check_data.log 2>&1 &
 
 nohup python3 convert_msm_data.py > convert_msm_data.log 2>&1 &
