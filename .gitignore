@@ -6,3 +6,5 @@ MSM_data/
 output_nc/
 *.log
 trash/
+*.pth
+*.png

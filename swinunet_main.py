@@ -63,8 +63,10 @@ MODEL_SAVE_PATH = 'best_swin_unet_model_ddp_monthly.pth'
 PLOT_SAVE_PATH = 'loss_curve_monthly.png'
 RESULT_IMG_DIR = 'result_images_monthly'
 
+NUM_WORKERS=4
+
 # --- 学習パラメータ ---
-BATCH_SIZE = 4
+BATCH_SIZE = 16
 NUM_EPOCHS = 20
 LEARNING_RATE = 1e-4
 
@@ -417,12 +419,11 @@ def main_worker(rank, world_size):
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     valid_sampler = DistributedSampler(valid_dataset, num_replicas=world_size, rank=rank, shuffle=False)
     
-    # 【修正4】num_workersを0に変更（マルチプロセス環境での安定性向上）
     train_loader = DataLoader(
         train_dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=False, 
-        num_workers=0,  # 0に変更
+        num_workers=NUM_WORKERS,
         pin_memory=True, 
         sampler=train_sampler
     )
@@ -430,7 +431,7 @@ def main_worker(rank, world_size):
         valid_dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=False, 
-        num_workers=0,  # 0に変更
+        num_workers=NUM_WORKERS,
         pin_memory=True, 
         sampler=valid_sampler
     )
@@ -449,7 +450,9 @@ def main_worker(rank, world_size):
     # --- 損失関数、オプティマイザ、スケーラー ---
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * world_size)
     scaler = GradScaler()
-    
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
+
     # --- 学習ループ ---
     if rank == 0:
         print("INFO: Starting training...")
@@ -463,6 +466,9 @@ def main_worker(rank, world_size):
     for epoch in range(NUM_EPOCHS):
         train_losses = train_one_epoch(rank, model, train_loader, optimizer, scaler, epoch)
         val_losses = validate_one_epoch(rank, model, valid_loader, epoch)
+
+        # スケジューラの更新
+        scheduler.step()
         
         loss_history['train_loss'].append(train_losses[0])
         loss_history['train_1h_rmse'].append(train_losses[1])
