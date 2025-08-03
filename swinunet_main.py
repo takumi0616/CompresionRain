@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# swinunet_main.py (月次データ対応・改善版)
+# swinunet_main.py (月次データ対応・改善版・再現性対応版)
 import os
 import glob
 import warnings
@@ -20,6 +20,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 import logging
 import sys
+import random
 
 # 可視化向上のためにcartopyをインポート
 try:
@@ -65,6 +66,9 @@ BATCH_SIZE = 8
 NUM_EPOCHS = 3
 LEARNING_RATE = 1e-4
 
+# --- ★【新規】再現性確保のための乱数シード設定 ---
+RANDOM_SEED = 42
+
 # --- モデルパラメータ ---
 IMG_SIZE = 480
 PATCH_SIZE = 4
@@ -82,6 +86,21 @@ TIME_VARS = ['dayofyear_sin', 'dayofyear_cos', 'hour_sin', 'hour_cos']
 TARGET_VARS_1H = ['Prec_Target_ft4', 'Prec_Target_ft5', 'Prec_Target_ft6']
 TARGET_VAR_SUM = 'Prec_4_6h_sum'
 IN_CHANS = len(INPUT_VARS_COMMON) * 2 + len(INPUT_VARS_PREC) + len(TIME_VARS)
+
+# ==============================================================================
+# 1.5. ★【新規】再現性確保のための関数
+# ==============================================================================
+def set_seed(seed):
+    """各種ライブラリの乱数シードを固定し、再現性を確保する"""
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # for multi-GPU
+    # PyTorchの決定的アルゴリズムを使用する設定
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def get_monthly_files(data_dir, years, logger=None):
@@ -379,6 +398,9 @@ def plot_loss_curve(history, save_path, logger):
 # ==============================================================================
 def main_worker(rank, world_size, train_files, valid_files):
     """DDPの各プロセスで実行されるメインの学習処理"""
+    # ★【変更】各ワーカープロセスでシードを設定
+    set_seed(RANDOM_SEED)
+    
     setup_ddp(rank, world_size)
     
     main_log = None
@@ -387,6 +409,7 @@ def main_worker(rank, world_size, train_files, valid_files):
         main_log = logging.getLogger('main') # rank 0のみロガーを取得
         main_log.info(f"DDP on {world_size} GPUs. Total batch size: {BATCH_SIZE * world_size}")
         main_log.info(f"Input channels: {IN_CHANS}")
+        main_log.info(f"RANDOM_SEED set to: {RANDOM_SEED} for reproducibility.") # ★ログ出力追加
     
     # --- データセットとデータローダー ---
     # rank 0 でのみログ出力するようにロガーを渡す
@@ -463,6 +486,9 @@ def main_worker(rank, world_size, train_files, valid_files):
 # 8. メイン実行ブロック
 # ==============================================================================
 if __name__ == '__main__':
+    # ★【変更】メインプロセスで最初にシードを設定
+    set_seed(RANDOM_SEED)
+
     # 結果保存ディレクトリを作成
     os.makedirs(RESULT_DIR, exist_ok=True)
     

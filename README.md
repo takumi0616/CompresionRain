@@ -32,7 +32,8 @@ for year in MSM_data/*/; do
 done
 ```
 
-DDPによるGPUエラー時のコマンド
+DDP による GPU エラー時のコマンド
+
 ```bash
 sudo kill -9 1493785
 ```
