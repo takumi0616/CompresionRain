@@ -6,6 +6,7 @@ from einops import rearrange
 import math
 
 
+
 class MoEFFNGating(nn.Module):
     def __init__(self, dim, hidden_dim, num_experts):
         super(MoEFFNGating, self).__init__()

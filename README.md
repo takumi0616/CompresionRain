@@ -31,3 +31,8 @@ for year in MSM_data/*/; do
     rm -f "$year"*.5b7b6.idx
 done
 ```
+
+DDPによるGPUエラー時のコマンド
+```bash
+sudo kill -9 1493785
+```
