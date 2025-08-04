@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# swinunet_main.py (月次データ対応・改善版・再現性対応版)
+# swinunet_main.py (月次データ対応・改善版・再現性対応版・評価機能追加版)
 import os
 import glob
 import warnings
@@ -58,17 +58,19 @@ PLOT_SAVE_PATH = os.path.join(RESULT_DIR, 'loss_curve_monthly.png')
 RESULT_IMG_DIR = os.path.join(RESULT_DIR, 'result_images_monthly')
 MAIN_LOG_PATH = os.path.join(RESULT_DIR, 'main.log')
 EXEC_LOG_PATH = os.path.join(RESULT_DIR, 'execution.log')
+# 【新規】評価ログのパスを追加
+EVALUATION_LOG_PATH = os.path.join(RESULT_DIR, 'evaluation.log')
 
 
 NUM_WORKERS=0
 
 # --- 学習パラメータ ---
 BATCH_SIZE = 8
-NUM_EPOCHS = 3
+NUM_EPOCHS = 50
 LEARNING_RATE = 1e-4
 
 # --- 再現性確保のための乱数シード設定 ---
-RANDOM_SEED = 42
+RANDOM_SEED = 40
 
 # --- モデルパラメータ ---
 IMG_SIZE = 480
@@ -146,6 +148,10 @@ def setup_loggers():
     # 実行ログ (tqdm用) ファイルを初期化
     with open(EXEC_LOG_PATH, 'w', encoding='utf-8') as f:
         f.write("Execution log started.\n")
+
+    # 【新規】評価ログファイルを初期化
+    with open(EVALUATION_LOG_PATH, 'w', encoding='utf-8') as f:
+        f.write("Evaluation log started.\n\n")
             
     return main_logger, EXEC_LOG_PATH
 
@@ -241,7 +247,6 @@ def train_one_epoch(rank, model, dataloader, optimizer, scaler, epoch, exec_log_
     total_loss, total_1h_rmse, total_sum_rmse = 0.0, 0.0, 0.0
     dataloader.sampler.set_epoch(epoch)
     
-    # tqdmの出力を execution.log にリダイレクト
     with open(exec_log_path, 'a', encoding='utf-8') as log_file:
         progress_bar = tqdm(
             dataloader, desc=f"Train Epoch {epoch+1}", disable=(rank != 0), 
@@ -296,7 +301,7 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
     return avg_loss.cpu().numpy()
 
 # ==============================================================================
-# 6. 可視化 & プロット関数
+# 6. 可視化 & プロット & 評価関数
 # ==============================================================================
 @torch.no_grad()
 def visualize_final_results(rank, world_size, valid_dataset, best_model_path, result_img_dir, main_logger, exec_log_path):
@@ -306,7 +311,6 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             main_logger.warning("Cartopyが見つからないため、最終的な可視化をスキップします。")
         return
 
-    # モデルを再度初期化し、最適な重みを読み込む
     device = torch.device(f"cuda:{rank}")
     model = SwinTransformerSys(
         img_size=IMG_SIZE, patch_size=PATCH_SIZE, in_chans=IN_CHANS, num_classes=NUM_CLASSES,
@@ -320,7 +324,6 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
         os.makedirs(result_img_dir, exist_ok=True)
         main_logger.info(f"検証データ全体に対する可視化を開始 (モデル: {os.path.basename(best_model_path)})")
     
-    # 各プロセスが処理するインデックスを決定
     indices = list(range(len(valid_dataset)))
     proc_indices = indices[rank::world_size]
 
@@ -407,6 +410,81 @@ def plot_loss_curve(history, save_path, logger, best_epoch):
     plt.close()
     logger.info(f"Loss curve saved to '{save_path}'.")
 
+@torch.no_grad()
+def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger):
+    """最終モデルをロードし、降水の有無で二値分類評価を行う"""
+    main_logger.info("Starting final model evaluation...")
+    
+    model = SwinTransformerSys(
+        img_size=IMG_SIZE, patch_size=PATCH_SIZE, in_chans=IN_CHANS, num_classes=NUM_CLASSES,
+        embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=15,
+        mlp_ratio=4., qkv_bias=True, norm_layer=nn.LayerNorm, use_checkpoint=False
+    ).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    # 評価用にDDPサンプラーなしのデータローダーを作成
+    eval_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+    
+    total_tp, total_tn, total_fp, total_fn = 0, 0, 0, 0
+    
+    # 降水有無の閾値
+    prec_threshold = 0.0
+
+    progress_bar = tqdm(eval_loader, desc="Evaluating Model", leave=False)
+    for batch in progress_bar:
+        inputs = batch['input'].to(device)
+        targets_1h = batch['target_1h'].to(device)
+
+        with autocast(device_type='cuda', dtype=torch.float16):
+            outputs = model(inputs)
+        
+        outputs = torch.relu(outputs)
+
+        pred_binary = (outputs > prec_threshold).cpu().numpy()
+        true_binary = (targets_1h > prec_threshold).cpu().numpy()
+
+        total_tp += np.sum(np.logical_and(pred_binary, true_binary))
+        total_tn += np.sum(np.logical_and(np.logical_not(pred_binary), np.logical_not(true_binary)))
+        total_fp += np.sum(np.logical_and(pred_binary, np.logical_not(true_binary)))
+        total_fn += np.sum(np.logical_and(np.logical_not(pred_binary), true_binary))
+
+    # 指標の計算 (ゼロ除算を回避)
+    epsilon = 1e-6
+    accuracy = (total_tp + total_tn) / (total_tp + total_tn + total_fp + total_fn + epsilon)
+    precision = total_tp / (total_tp + total_fp + epsilon)
+    recall = total_tp / (total_tp + total_fn + epsilon)
+    f1_score = 2 * (precision * recall) / (precision + recall + epsilon)
+    csi = total_tp / (total_tp + total_fp + total_fn + epsilon)
+
+    # 結果をログファイルに書き込む
+    with open(eval_log_path, 'a', encoding='utf-8') as f:
+        f.write("="*50 + "\n")
+        f.write("Final Model Evaluation (Binary Classification for Precipitation)\n")
+        f.write(f"Threshold for precipitation: > {prec_threshold} mm\n")
+        f.write("="*50 + "\n\n")
+        f.write(f"Total Pixels: {total_tp + total_tn + total_fp + total_fn}\n")
+        f.write(f"True Positives (TP - 予測も正解も降水あり): {total_tp}\n")
+        f.write(f"True Negatives (TN - 予測も正解も降水なし): {total_tn}\n")
+        f.write(f"False Positives (FP - 予測は降水あり、正解はなし): {total_fp}\n")
+        f.write(f"False Negatives (FN - 予測は降水なし、正解はあり): {total_fn}\n\n")
+        f.write("="*50 + "\n")
+        f.write("Performance Metrics:\n")
+        f.write("="*50 + "\n\n")
+        f.write(f"Accuracy (正解率): {accuracy:.4f}\n")
+        f.write("  - 説明: 全てのピクセルの中で、予測が正解と一致した割合。\n\n")
+        f.write(f"Precision (適合率): {precision:.4f}\n")
+        f.write("  - 説明: 「降水あり」と予測した中で、実際に降水があった割合。\n\n")
+        f.write(f"Recall (再現率): {recall:.4f}\n")
+        f.write("  - 説明: 実際に降水があった中で、正しく「降水あり」と予測できた割合。\n\n")
+        f.write(f"F1 Score (F1値): {f1_score:.4f}\n")
+        f.write("  - 説明: 適合率と再現率の調和平均。モデル性能のバランスを示す。\n\n")
+        f.write(f"CSI (Critical Success Index / Threat Score): {csi:.4f}\n")
+        f.write("  - 説明: 気象分野でよく使われる指標。「降水なし」の正解を除外して計算するため、降水予測性能をより的確に評価できる。\n\n")
+
+    main_logger.info(f"Evaluation finished. Results saved to '{eval_log_path}'")
+
+
 # ==============================================================================
 # 7. メインワーカ関数
 # ==============================================================================
@@ -424,8 +502,6 @@ def main_worker(rank, world_size, train_files, valid_files):
         main_log.info(f"Input channels: {IN_CHANS}")
         main_log.info(f"RANDOM_SEED set to: {RANDOM_SEED} for reproducibility.")
     
-    # --- データセットとデータローダー ---
-    # rank 0 でのみログ出力するようにロガーを渡す
     train_dataset = NetCDFDataset(train_files, logger=(main_log if rank == 0 else None))
     valid_dataset = NetCDFDataset(valid_files, logger=(main_log if rank == 0 else None))
     
@@ -435,21 +511,18 @@ def main_worker(rank, world_size, train_files, valid_files):
     valid_sampler = DistributedSampler(valid_dataset, num_replicas=world_size, rank=rank, shuffle=False)
     valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True, sampler=valid_sampler)
     
-    # --- モデル ---
     model = SwinTransformerSys(
         img_size=IMG_SIZE, patch_size=PATCH_SIZE, in_chans=IN_CHANS, num_classes=NUM_CLASSES,
         embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=15,
         mlp_ratio=4., qkv_bias=True, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
         norm_layer=nn.LayerNorm, ape=False, patch_norm=True, use_checkpoint=False
     ).to(rank)
-    # model = torch.compile(model, mode="reduce-overhead") # エラーが出るためコメントアウト化
     model = DDP(model, device_ids=[rank], find_unused_parameters=False)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * world_size)
     scaler = GradScaler()
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
 
-    # --- 学習ループ ---
     if rank == 0: main_log.info("Starting training...")
     
     best_val_loss = float('inf')
@@ -464,7 +537,6 @@ def main_worker(rank, world_size, train_files, valid_files):
         val_losses = validate_one_epoch(rank, model, valid_loader, epoch, exec_log_path)
         scheduler.step()
         
-        # 全プロセスで履歴を保持
         loss_history['train_loss'].append(train_losses[0]); loss_history['train_1h_rmse'].append(train_losses[1]); loss_history['train_sum_rmse'].append(train_losses[2])
         loss_history['val_loss'].append(val_losses[0]); loss_history['val_1h_rmse'].append(val_losses[1]); loss_history['val_sum_rmse'].append(val_losses[2])
         
@@ -473,7 +545,6 @@ def main_worker(rank, world_size, train_files, valid_files):
             main_log.info(f"Train Loss: {train_losses[0]:.4f} (1h_rmse: {train_losses[1]:.4f}, sum_rmse: {train_losses[2]:.4f})")
             main_log.info(f"Valid Loss: {val_losses[0]:.4f} (1h_rmse: {val_losses[1]:.4f}, sum_rmse: {val_losses[2]:.4f})")
             
-            # 【改善③】最適なモデルを随時保存
             if val_losses[0] < best_val_loss:
                 best_val_loss = val_losses[0]
                 best_epoch = epoch + 1
@@ -484,13 +555,14 @@ def main_worker(rank, world_size, train_files, valid_files):
 
     if rank == 0: main_log.info("\nTraining finished.")
         
-    # --- 学習後の処理 ---
     visualize_final_results(rank, world_size, valid_dataset, MODEL_SAVE_PATH, RESULT_IMG_DIR, main_log, exec_log_path)
     
     dist.barrier()
 
     if rank == 0:
         plot_loss_curve(loss_history, PLOT_SAVE_PATH, main_log, best_epoch)
+        # 【新規】最終評価を実行
+        evaluate_model(MODEL_SAVE_PATH, valid_dataset, torch.device(f"cuda:{rank}"), EVALUATION_LOG_PATH, main_log)
         main_log.info(f"Result images saved in '{RESULT_IMG_DIR}/'.")
         main_log.info("All processes finished successfully.")
     
@@ -500,13 +572,10 @@ def main_worker(rank, world_size, train_files, valid_files):
 # 8. メイン実行ブロック
 # ==============================================================================
 if __name__ == '__main__':
-    # ★【変更】メインプロセスで最初にシードを設定
     set_seed(RANDOM_SEED)
 
-    # 結果保存ディレクトリを作成
     os.makedirs(RESULT_DIR, exist_ok=True)
     
-    # ロガーをセットアップ
     main_logger, _ = setup_loggers()
 
     main_logger.info(f"データディレクトリ: {DATA_DIR}")
