@@ -6,6 +6,7 @@ import glob
 import warnings
 import hdf5plugin
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -48,7 +49,7 @@ DATA_DIR = './optimization_nc'
 TRAIN_YEARS = [2018, 2019, 2020, 2021]
 VALID_YEARS = [2022]
 
-# --- 【改善①】結果の保存先ディレクトリを一元管理 ---
+# --- 結果の保存先ディレクトリを一元管理 ---
 RESULT_DIR = 'swin-unet_main_result'
 
 # モデル、プロット、ログの保存先パスを定義
@@ -66,7 +67,7 @@ BATCH_SIZE = 8
 NUM_EPOCHS = 3
 LEARNING_RATE = 1e-4
 
-# --- ★【新規】再現性確保のための乱数シード設定 ---
+# --- 再現性確保のための乱数シード設定 ---
 RANDOM_SEED = 42
 
 # --- モデルパラメータ ---
@@ -88,7 +89,7 @@ TARGET_VAR_SUM = 'Prec_4_6h_sum'
 IN_CHANS = len(INPUT_VARS_COMMON) * 2 + len(INPUT_VARS_PREC) + len(TIME_VARS)
 
 # ==============================================================================
-# 1.5. ★【新規】再現性確保のための関数
+# 1.5. 再現性確保のための関数
 # ==============================================================================
 def set_seed(seed):
     """各種ライブラリの乱数シードを固定し、再現性を確保する"""
@@ -118,7 +119,7 @@ def get_monthly_files(data_dir, years, logger=None):
     return files
 
 # ==============================================================================
-# 2. 【改善②】ロギング設定関数
+# 2. ロギング設定関数
 # ==============================================================================
 def setup_loggers():
     """ログ設定を行い、メインロガーと実行ログのパスを返す"""
@@ -295,10 +296,10 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
     return avg_loss.cpu().numpy()
 
 # ==============================================================================
-# 6. 【改善③】可視化 & プロット関数
+# 6. 可視化 & プロット関数
 # ==============================================================================
 @torch.no_grad()
-def visualize_final_results(rank, world_size, valid_dataset, best_model_path, result_img_dir, main_logger):
+def visualize_final_results(rank, world_size, valid_dataset, best_model_path, result_img_dir, main_logger, exec_log_path):
     """学習完了後、最適なモデルを使用して検証データ全体で高機能な可視化を行う"""
     if not CARTOPY_AVAILABLE:
         if rank == 0:
@@ -326,52 +327,65 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
     lon = valid_dataset.ds['lon'].values
     lat = valid_dataset.ds['lat'].values
     map_extent = [lon.min(), lon.max(), lat.min(), lat.max()]
+    
+    with open(exec_log_path, 'a', encoding='utf-8') as log_file:
+        progress_bar = tqdm(
+            proc_indices, desc=f"Visualizing on Rank {rank}", 
+            disable=(rank!=0), file=log_file,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
+        )
 
-    progress_bar = tqdm(proc_indices, desc=f"Visualizing on Rank {rank}", disable=(rank!=0))
+        for idx in progress_bar:
+            sample = valid_dataset[idx]
+            inputs = sample['input'].unsqueeze(0).to(device)
+            target_1h = sample['target_1h']
 
-    for idx in progress_bar:
-        sample = valid_dataset[idx]
-        inputs = sample['input'].unsqueeze(0).to(device)
-        target_1h = sample['target_1h']
+            with autocast(device_type='cuda', dtype=torch.float16):
+                output = model(inputs)
+            output = torch.relu(output).squeeze(0).cpu()
 
-        with autocast(device_type='cuda', dtype=torch.float16):
-            output = model(inputs)
-        output = torch.relu(output).squeeze(0).cpu()
+            fig, axes = plt.subplots(2, 3, figsize=(20, 12), subplot_kw={'projection': ccrs.PlateCarree()})
+            time_val = valid_dataset.ds.time.values[idx]
+            fig.suptitle(f"Validation Time: {np.datetime_as_string(time_val, unit='m')}", fontsize=16)
 
-        fig, axes = plt.subplots(2, 3, figsize=(20, 12), subplot_kw={'projection': ccrs.PlateCarree()})
-        time_val = valid_dataset.ds.time.values[idx]
-        fig.suptitle(f"Validation Time: {np.datetime_as_string(time_val, unit='m')}", fontsize=16)
+            plot_data = [output[0], output[1], output[2], target_1h[0], target_1h[1], target_1h[2]]
+            titles = [f'Prediction FT+{i}' for i in [4,5,6]] + [f'Ground Truth FT+{i}' for i in [4,5,6]]
+            vmax = max(target_1h.max(), output.max(), 0.1)
+            cmap = plt.get_cmap("Blues")
+            cmap.set_under(alpha=0)
+            vmin_val = 1e-4
 
-        plot_data = [output[0], output[1], output[2], target_1h[0], target_1h[1], target_1h[2]]
-        titles = [f'Prediction FT+{i}' for i in [4,5,6]] + [f'Ground Truth FT+{i}' for i in [4,5,6]]
-        vmax = max(target_1h.max(), output.max(), 0.1)
+            for i, ax in enumerate(axes.flat):
+                ax.set_extent(map_extent, crs=ccrs.PlateCarree())
+                ax.add_feature(cfeature.COASTLINE, edgecolor='black')
+                ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='black')
+                gl = ax.gridlines(draw_labels=True, dms=True, x_inline=False, y_inline=False, color='gray', alpha=0.5)
+                gl.top_labels = False
+                gl.right_labels = False
+                
+                im = ax.imshow(plot_data[i], extent=map_extent, origin='upper', cmap=cmap, vmin=vmin_val, vmax=vmax)
+                ax.set_title(titles[i])
+                fig.colorbar(im, ax=ax, shrink=0.7, label='Precipitation (mm)')
 
-        for i, ax in enumerate(axes.flat):
-            ax.set_extent(map_extent, crs=ccrs.PlateCarree())
-            ax.add_feature(cfeature.COASTLINE, edgecolor='black')
-            ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='black')
-            gl = ax.gridlines(draw_labels=True, dms=True, x_inline=False, y_inline=False, color='gray', alpha=0.5)
-            gl.top_labels = False
-            gl.right_labels = False
-            
-            im = ax.imshow(plot_data[i], extent=map_extent, origin='upper', cmap='jet', vmin=0, vmax=vmax)
-            ax.set_title(titles[i])
-            fig.colorbar(im, ax=ax, shrink=0.7, label='Precipitation (mm)')
+            plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+            time_str = np.datetime_as_string(time_val, unit='h').replace(':', '-').replace('T', '_')
+            save_path = os.path.join(result_img_dir, f'validation_{time_str}.png')
+            plt.savefig(save_path, dpi=150)
+            plt.close(fig)
 
-        plt.tight_layout(rect=[0, 0.03, 1, 0.96])
-        time_str = np.datetime_as_string(time_val, unit='h').replace(':', '-').replace('T', '_')
-        save_path = os.path.join(result_img_dir, f'validation_{time_str}.png')
-        plt.savefig(save_path, dpi=150)
-        plt.close(fig)
-
-def plot_loss_curve(history, save_path, logger):
-    """損失曲線をプロットして保存"""
+def plot_loss_curve(history, save_path, logger, best_epoch):
+    """損失曲線をプロットして保存し、最適なエポックに線を引く"""
     plt.figure(figsize=(12, 8))
     epochs_range = range(1, len(history['train_loss']) + 1)
     
     plt.subplot(2, 1, 1)
     plt.plot(epochs_range, history['train_loss'], 'bo-', label='Training Total Loss')
     plt.plot(epochs_range, history['val_loss'], 'ro-', label='Validation Total Loss')
+    
+    if best_epoch != -1:
+        best_loss_val = history['val_loss'][best_epoch-1]
+        plt.axvline(x=best_epoch, color='k', linestyle='--', label=f'Best Epoch: {best_epoch} (Loss: {best_loss_val:.4f})')
+
     plt.title('Total Loss Curve (MSE-based)')
     plt.ylabel('Loss')
     plt.legend(); plt.grid(True)
@@ -398,18 +412,17 @@ def plot_loss_curve(history, save_path, logger):
 # ==============================================================================
 def main_worker(rank, world_size, train_files, valid_files):
     """DDPの各プロセスで実行されるメインの学習処理"""
-    # ★【変更】各ワーカープロセスでシードを設定
     set_seed(RANDOM_SEED)
     
     setup_ddp(rank, world_size)
     
     main_log = None
-    exec_log_path = EXEC_LOG_PATH  # 全プロセスでパスを共有
+    exec_log_path = EXEC_LOG_PATH
     if rank == 0:
-        main_log = logging.getLogger('main') # rank 0のみロガーを取得
+        main_log = logging.getLogger('main')
         main_log.info(f"DDP on {world_size} GPUs. Total batch size: {BATCH_SIZE * world_size}")
         main_log.info(f"Input channels: {IN_CHANS}")
-        main_log.info(f"RANDOM_SEED set to: {RANDOM_SEED} for reproducibility.") # ★ログ出力追加
+        main_log.info(f"RANDOM_SEED set to: {RANDOM_SEED} for reproducibility.")
     
     # --- データセットとデータローダー ---
     # rank 0 でのみログ出力するようにロガーを渡す
@@ -440,6 +453,7 @@ def main_worker(rank, world_size, train_files, valid_files):
     if rank == 0: main_log.info("Starting training...")
     
     best_val_loss = float('inf')
+    best_epoch = -1
     loss_history = {
         'train_loss': [], 'train_1h_rmse': [], 'train_sum_rmse': [],
         'val_loss': [], 'val_1h_rmse': [], 'val_sum_rmse': []
@@ -459,24 +473,24 @@ def main_worker(rank, world_size, train_files, valid_files):
             main_log.info(f"Train Loss: {train_losses[0]:.4f} (1h_rmse: {train_losses[1]:.4f}, sum_rmse: {train_losses[2]:.4f})")
             main_log.info(f"Valid Loss: {val_losses[0]:.4f} (1h_rmse: {val_losses[1]:.4f}, sum_rmse: {val_losses[2]:.4f})")
             
-            # --- 【改善④】最適なモデルを随時保存 ---
+            # 【改善③】最適なモデルを随時保存
             if val_losses[0] < best_val_loss:
                 best_val_loss = val_losses[0]
+                best_epoch = epoch + 1
                 torch.save(model.module.state_dict(), MODEL_SAVE_PATH)
-                main_log.info(f"Saved best model with validation loss: {best_val_loss:.4f}")
+                main_log.info(f"Saved best model at epoch {best_epoch} with validation loss: {best_val_loss:.4f}")
     
-    dist.barrier() # 全プロセスの学習完了を待つ
+    dist.barrier()
 
     if rank == 0: main_log.info("\nTraining finished.")
         
     # --- 学習後の処理 ---
-    # 全プロセスで可視化を並列実行
-    visualize_final_results(rank, world_size, valid_dataset, MODEL_SAVE_PATH, RESULT_IMG_DIR, main_log)
+    visualize_final_results(rank, world_size, valid_dataset, MODEL_SAVE_PATH, RESULT_IMG_DIR, main_log, exec_log_path)
     
-    dist.barrier() # 可視化の完了を待つ
+    dist.barrier()
 
     if rank == 0:
-        plot_loss_curve(loss_history, PLOT_SAVE_PATH, main_log)
+        plot_loss_curve(loss_history, PLOT_SAVE_PATH, main_log, best_epoch)
         main_log.info(f"Result images saved in '{RESULT_IMG_DIR}/'.")
         main_log.info("All processes finished successfully.")
     
