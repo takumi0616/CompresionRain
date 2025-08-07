@@ -22,8 +22,6 @@ from tqdm import tqdm
 import logging
 import sys
 import random
-
-# 可視化向上のためにcartopyをインポート
 try:
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
@@ -32,11 +30,7 @@ except ImportError:
     CARTOPY_AVAILABLE = False
     warnings.warn("Cartopyがインストールされていないため、可視化機能が制限されます。'pip install cartopy'でインストールしてください。")
 
-
-# 警告を非表示
 warnings.filterwarnings("ignore", category=UserWarning)
-
-# HDF5の環境変数を設定
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
 os.environ['HDF5_DISABLE_VERSION_CHECK'] = '1'
 
@@ -60,7 +54,6 @@ MAIN_LOG_PATH = os.path.join(RESULT_DIR, 'main.log')
 EXEC_LOG_PATH = os.path.join(RESULT_DIR, 'execution.log')
 # 【新規】評価ログのパスを追加
 EVALUATION_LOG_PATH = os.path.join(RESULT_DIR, 'evaluation.log')
-
 
 NUM_WORKERS=0
 
