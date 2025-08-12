@@ -22,13 +22,9 @@ from tqdm import tqdm
 import logging
 import sys
 import random
-try:
-    import cartopy.crs as ccrs
-    import cartopy.feature as cfeature
-    CARTOPY_AVAILABLE = True
-except ImportError:
-    CARTOPY_AVAILABLE = False
-    warnings.warn("Cartopyがインストールされていないため、可視化機能が制限されます。'pip install cartopy'でインストールしてください。")
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+CARTOPY_AVAILABLE = True
 
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
@@ -44,7 +40,7 @@ TRAIN_YEARS = [2018, 2019, 2020, 2021]
 VALID_YEARS = [2022]
 
 # --- 結果の保存先ディレクトリを一元管理 ---
-RESULT_DIR = 'swin-unet_main_result'
+RESULT_DIR = 'swin-unet_main_result_v1'
 
 # モデル、プロット、ログの保存先パスを定義
 MODEL_SAVE_PATH = os.path.join(RESULT_DIR, 'best_swin_unet_model_ddp_monthly.pth')
