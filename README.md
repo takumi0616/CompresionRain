@@ -18,7 +18,9 @@ nohup python3 check_MSM_data_nc.py > check_MSM_data_nc.log 2>&1 &
 タスクの削除
 
 ```bash
-pkill -f "swinunet_main.py"
+pkill -f "swinunet_main_v1.py"
+
+pkill -f "swinunet_main_v2.py"
 
 pkill -f "convert_data_v1.py"
 

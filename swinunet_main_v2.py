@@ -7,6 +7,7 @@
 # - 可視化: 対数表示(LogNorm)で見やすく
 # - 評価: equal-split(積算を3分割)ベースラインとの比較
 # - 評価: 3時間の降水「あり時間数」(0/1/2/3)のパターン一致評価
+# - 追加(v2+): 各評価指標のエポック推移をプロット・保存
 
 import os
 import glob
@@ -58,10 +59,13 @@ MAIN_LOG_PATH = os.path.join(RESULT_DIR, 'main_v2.log')
 EXEC_LOG_PATH = os.path.join(RESULT_DIR, 'execution_v2.log')
 EVALUATION_LOG_PATH = os.path.join(RESULT_DIR, 'evaluation_v2.log')
 
+# 追加: エポックメトリクスの図出力ディレクトリ
+EPOCH_METRIC_PLOT_DIR = os.path.join(RESULT_DIR, 'epoch_metrics_plots_v2')
+
 NUM_WORKERS = 0
 
 # --- 学習パラメータ ---
-BATCH_SIZE = 8
+BATCH_SIZE = 16
 NUM_EPOCHS = 50
 LEARNING_RATE = 1e-4
 
@@ -257,31 +261,236 @@ def train_one_epoch(rank, model, dataloader, optimizer, scaler, epoch, exec_log_
     dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
     return avg_loss.cpu().numpy()
 
+# -------------------- 評価ユーティリティ --------------------
+def _tally_binary(pred, true, thr):
+    """2値判定のTP/TN/FP/FNを返す（pred, trueは同形状テンソル/ndarray, mm単位）"""
+    pred_bin = pred > thr
+    true_bin = true > thr
+    tp = np.logical_and(pred_bin, true_bin).sum()
+    tn = np.logical_and(~pred_bin, ~true_bin).sum()
+    fp = np.logical_and(pred_bin, ~true_bin).sum()
+    fn = np.logical_and(~pred_bin, true_bin).sum()
+    return tp, tn, fp, fn
+
+def _digitize_bins(x, bins):
+    """連続値をカテゴリbin(右開区間)に割り当てる（numpy.digitize準拠）"""
+    return np.digitize(x, bins, right=False) - 1  # 0始まりのカテゴリID
+
 @torch.no_grad()
 def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
+    """
+    1エポック分の検証処理 + 全評価指標の集計（DDPでall_reduceして集計）
+    戻り値:
+      - avg_losses: np.array([total_loss, rmse_1h, rmse_sum])
+      - epoch_metrics: dict (rank==0のみ有効、他rankはNone)
+    """
     model.eval()
     total_loss, total_1h_rmse, total_sum_rmse = 0.0, 0.0, 0.0
+
+    # 追加: メトリクス集計用（ローカルバッファ）
+    T = len(BINARY_THRESHOLDS_MM)
+    K = len(CATEGORY_BINS_MM) - 1
+
+    # バイナリ指標（時刻別・積算）のカウンタ: shape (T, 4) for [tp, tn, fp, fn]
+    bin_counts_hourly = np.zeros((T, 4), dtype=np.int64)
+    bin_counts_sum = np.zeros((T, 4), dtype=np.int64)
+
+    # カテゴリ混同行列（時刻別・積算）
+    confmat_hourly = np.zeros((K, K), dtype=np.int64)
+    confmat_sum = np.zeros((K, K), dtype=np.int64)
+
+    # RMSE関連（ベースライン比較・積算）
+    sse_model_1h = 0.0
+    sse_base_1h = 0.0
+    count_1h = 0
+    sse_sum = 0.0
+    count_sum = 0
+
+    # Wet-hourパターン（0..3）混同行列
+    conf_wethours = np.zeros((4, 4), dtype=np.int64)
+
     with open(exec_log_path, 'a', encoding='utf-8') as log_file:
         progress_bar = tqdm(
-            dataloader, desc=f"Valid Epoch {epoch+1}", disable=(rank != 0), 
+            dataloader, desc=f"Valid Epoch {epoch+1}", disable=(rank != 0),
             leave=True, file=log_file,
             bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
         )
         for batch in progress_bar:
             inputs = batch['input'].to(rank, non_blocking=True)
             targets = {k: v.to(rank, non_blocking=True) for k, v in batch.items() if k != 'input'}
+
             with autocast(device_type='cuda', dtype=torch.float16):
                 outputs = model(inputs)
                 loss, loss_1h, loss_sum = custom_loss_function(outputs, targets)
+
             total_loss += loss.item()
             total_1h_rmse += loss_1h.item()
             total_sum_rmse += loss_sum.item()
+
+            # 追加: 詳細メトリクスのためのデータ
+            outputs = torch.relu(outputs)
+            pred_1h = outputs.detach().cpu().numpy()       # (B,3,H,W)
+            true_1h = targets['target_1h'].detach().cpu().numpy()
+            pred_sum = outputs.sum(dim=1, keepdim=True).detach().cpu().numpy()  # (B,1,H,W)
+            true_sum = targets['target_sum'].detach().cpu().numpy()
+            B, _, H, W = outputs.shape
+
+            # バイナリ（時刻別・積算）
+            for i, thr in enumerate(BINARY_THRESHOLDS_MM):
+                tp, tn, fp, fn = _tally_binary(pred_1h, true_1h, thr)
+                bin_counts_hourly[i, 0] += int(tp)
+                bin_counts_hourly[i, 1] += int(tn)
+                bin_counts_hourly[i, 2] += int(fp)
+                bin_counts_hourly[i, 3] += int(fn)
+
+                tp, tn, fp, fn = _tally_binary(pred_sum, true_sum, thr)
+                bin_counts_sum[i, 0] += int(tp)
+                bin_counts_sum[i, 1] += int(tn)
+                bin_counts_sum[i, 2] += int(fp)
+                bin_counts_sum[i, 3] += int(fn)
+
+            # カテゴリ（時刻別）
+            for t in range(3):
+                true_bins = _digitize_bins(true_1h[:, t, :, :].ravel(), CATEGORY_BINS_MM)
+                pred_bins = _digitize_bins(pred_1h[:, t, :, :].ravel(), CATEGORY_BINS_MM)
+                # 高速更新
+                idx = (true_bins >= 0) & (true_bins < K) & (pred_bins >= 0) & (pred_bins < K)
+                tb = true_bins[idx]; pb = pred_bins[idx]
+                # np.add.atで一括加算
+                np.add.at(confmat_hourly, (tb, pb), 1)
+
+            # カテゴリ（積算）
+            true_bins_sum = _digitize_bins(true_sum.ravel(), CATEGORY_BINS_MM)
+            pred_bins_sum = _digitize_bins(pred_sum.ravel(), CATEGORY_BINS_MM)
+            idx2 = (true_bins_sum >= 0) & (true_bins_sum < K) & (pred_bins_sum >= 0) & (pred_bins_sum < K)
+            tb2 = true_bins_sum[idx2]; pb2 = pred_bins_sum[idx2]
+            np.add.at(confmat_sum, (tb2, pb2), 1)
+
+            # equal-splitベースライン vs モデルの1hRMSE
+            base_1h = np.repeat(pred_sum / 3.0, repeats=3, axis=1)
+            diff_model = (pred_1h - true_1h)
+            diff_base = (base_1h - true_1h)
+            sse_model_1h += float(np.sum(diff_model**2))
+            sse_base_1h += float(np.sum(diff_base**2))
+            count_1h += int(B * 3 * H * W)
+
+            # 積算RMSE
+            diff_sum = (pred_sum - true_sum)
+            sse_sum += float(np.sum(diff_sum**2))
+            count_sum += int(B * H * W)
+
+            # Wet-hourパターン（0..3）
+            true_wet = (true_1h >= WETHOUR_THRESHOLD_MM)
+            pred_wet = (pred_1h >= WETHOUR_THRESHOLD_MM)
+            true_count = np.sum(true_wet, axis=1)
+            pred_count = np.sum(pred_wet, axis=1)
+            true_count = np.clip(true_count, 0, 3).astype(np.int64).ravel()
+            pred_count = np.clip(pred_count, 0, 3).astype(np.int64).ravel()
+            np.add.at(conf_wethours, (true_count, pred_count), 1)
+
             if rank == 0:
                 progress_bar.set_postfix(loss=loss.item())
-    
-    avg_loss = torch.tensor([total_loss, total_1h_rmse, total_sum_rmse], device=rank) / len(dataloader)
-    dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
-    return avg_loss.cpu().numpy()
+
+    # ここから分散集計（all_reduce）
+    device = torch.device(f"cuda:{rank}")
+    avg_loss = torch.tensor([total_loss, total_1h_rmse, total_sum_rmse], device=device, dtype=torch.float64) / len(dataloader)
+
+    # CPU集計 → Torchテンソル化
+    t_bin_hourly = torch.tensor(bin_counts_hourly, device=device, dtype=torch.float64)
+    t_bin_sum = torch.tensor(bin_counts_sum, device=device, dtype=torch.float64)
+    t_conf_hourly = torch.tensor(confmat_hourly, device=device, dtype=torch.float64)
+    t_conf_sum = torch.tensor(confmat_sum, device=device, dtype=torch.float64)
+    t_wh_conf = torch.tensor(conf_wethours, device=device, dtype=torch.float64)
+    t_sse_model_1h = torch.tensor(sse_model_1h, device=device, dtype=torch.float64)
+    t_sse_base_1h = torch.tensor(sse_base_1h, device=device, dtype=torch.float64)
+    t_count_1h = torch.tensor(count_1h, device=device, dtype=torch.float64)
+    t_sse_sum = torch.tensor(sse_sum, device=device, dtype=torch.float64)
+    t_count_sum = torch.tensor(count_sum, device=device, dtype=torch.float64)
+
+    # all_reduce (SUM)
+    dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)  # 損失は平均にしたいのでAVG（すでに/len済みでも並列間平均に揃える）
+    for t in [t_bin_hourly, t_bin_sum, t_conf_hourly, t_conf_sum, t_wh_conf,
+              t_sse_model_1h, t_sse_base_1h, t_count_1h, t_sse_sum, t_count_sum]:
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+    # rank0でメトリクス導出
+    epoch_metrics = None
+    if rank == 0:
+        epsilon = 1e-6
+        # バイナリ指標
+        def compute_binary_metrics_from_counts(counts):
+            # counts: (T, 4) [tp, tn, fp, fn]
+            out = {}
+            counts_np = counts.cpu().numpy()
+            for i, thr in enumerate(BINARY_THRESHOLDS_MM):
+                tp, tn, fp, fn = counts_np[i]
+                acc = (tp + tn) / (tp + tn + fp + fn + epsilon)
+                prec = tp / (tp + fp + epsilon)
+                rec = tp / (tp + fn + epsilon)
+                f1 = 2 * (prec * rec) / (prec + rec + epsilon)
+                csi = tp / (tp + fp + fn + epsilon)
+                out[thr] = {'accuracy': float(acc), 'precision': float(prec), 'recall': float(rec),
+                            'f1': float(f1), 'csi': float(csi)}
+            return out
+
+        metrics_hourly = compute_binary_metrics_from_counts(t_bin_hourly)
+        metrics_sum = compute_binary_metrics_from_counts(t_bin_sum)
+
+        # カテゴリ指標
+        def compute_categorical_metrics(confmat_t):
+            conf = confmat_t.cpu().numpy()
+            total = conf.sum()
+            diag = np.trace(conf)
+            acc = diag / (total + epsilon)
+            K_local = conf.shape[0]
+            precisions = np.zeros(K_local, dtype=np.float64)
+            recalls = np.zeros(K_local, dtype=np.float64)
+            for k in range(K_local):
+                col_sum = np.sum(conf[:, k])
+                row_sum = np.sum(conf[k, :])
+                tp_k = conf[k, k]
+                precisions[k] = tp_k / (col_sum + epsilon)
+                recalls[k] = tp_k / (row_sum + epsilon)
+            return float(acc), precisions, recalls
+
+        cat_acc_hourly, cat_prec_hourly, cat_rec_hourly = compute_categorical_metrics(t_conf_hourly)
+        cat_acc_sum, cat_prec_sum, cat_rec_sum = compute_categorical_metrics(t_conf_sum)
+
+        # RMSE
+        rmse_model_1h = float(torch.sqrt(t_sse_model_1h / (t_count_1h + epsilon)).item())
+        rmse_base_1h = float(torch.sqrt(t_sse_base_1h / (t_count_1h + epsilon)).item())
+        rmse_sum = float(torch.sqrt(t_sse_sum / (t_count_sum + epsilon)).item())
+
+        # Wet-hourパターン一致
+        wh_conf = t_wh_conf.cpu().numpy()
+        total_wh = wh_conf.sum()
+        diag_wh = np.trace(wh_conf)
+        acc_wethour_pattern = float(diag_wh / (total_wh + epsilon))
+
+        epoch_metrics = {
+            'binary_hourly': metrics_hourly,
+            'binary_sum': metrics_sum,
+            'categorical_hourly': {
+                'overall_acc': cat_acc_hourly,
+                'per_class_precision': cat_prec_hourly,
+                'per_class_recall': cat_rec_hourly
+            },
+            'categorical_sum': {
+                'overall_acc': cat_acc_sum,
+                'per_class_precision': cat_prec_sum,
+                'per_class_recall': cat_rec_sum
+            },
+            'rmse': {
+                'model_1h': rmse_model_1h,
+                'baseline_1h': rmse_base_1h,
+                'sum': rmse_sum
+            },
+            'wet_hour_pattern': {
+                'accuracy': acc_wethour_pattern
+            }
+        }
+
+    return avg_loss.cpu().numpy(), epoch_metrics
 
 # ==============================================================================
 # 6. 可視化 & プロット & 評価関数
@@ -345,10 +554,9 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
                 target_1h[0], target_1h[1], target_1h[2]
             ], dim=0).numpy()
             flat = stack_vals.reshape(8, -1)
-            # 0以下は除外してパーセンタイル計算
             flat_pos = flat[flat > 0.0]
             vmax_val = np.percentile(flat_pos, 99) if flat_pos.size > 0 else vmin_val * 10.0
-            if vmax_val <= vmin_val:  # 保険
+            if vmax_val <= vmin_val:
                 vmax_val = vmin_val * 10.0
 
             norm = LogNorm(vmin=vmin_val, vmax=vmax_val)
@@ -418,31 +626,118 @@ def plot_loss_curve(history, save_path, logger, best_epoch):
     plt.close()
     logger.info(f"Loss curve saved to '{save_path}'.")
 
-# -------------------- 評価ユーティリティ --------------------
-def _tally_binary(pred, true, thr):
-    """2値判定のTP/TN/FP/FNを返す（pred, trueは同形状テンソル/ndarray, mm単位）"""
-    pred_bin = pred > thr
-    true_bin = true > thr
-    tp = np.logical_and(pred_bin, true_bin).sum()
-    tn = np.logical_and(~pred_bin, ~true_bin).sum()
-    fp = np.logical_and(pred_bin, ~true_bin).sum()
-    fn = np.logical_and(~pred_bin, true_bin).sum()
-    return tp, tn, fp, fn
+def _class_labels_from_bins(bins):
+    labels = []
+    for i in range(len(bins)-1):
+        left = bins[i]
+        right = bins[i+1]
+        if np.isinf(right):
+            labels.append(f"{left:.0f}+")
+        else:
+            labels.append(f"{left:.0f}-{right:.0f}")
+    return labels
 
-def _digitize_bins(x, bins):
-    """連続値をカテゴリbin(右開区間)に割り当てる（numpy.digitize準拠）"""
-    # bins: 例えば [0,5,10,20,30,50,inf]
-    # np.digitizeは右側は閉区間にしないため、binsに合わせて通常利用でOK
-    return np.digitize(x, bins, right=False) - 1  # 0始まりのカテゴリID
+def plot_epoch_metrics(metric_history, out_dir, logger):
+    """各評価指標のエポック推移をまとめて図に保存"""
+    os.makedirs(out_dir, exist_ok=True)
+    epochs = np.arange(1, metric_history['num_epochs'] + 1)
+
+    # 1) Binary metrics (hourly/sum)
+    def plot_binary(kind):
+        # kind: 'binary_hourly' or 'binary_sum'
+        fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+        axes = axes.flat
+        metrics_list = ['accuracy', 'precision', 'recall', 'f1', 'csi']
+        titles = ['Accuracy', 'Precision', 'Recall', 'F1', 'CSI']
+        for m_idx, metric in enumerate(metrics_list):
+            ax = axes[m_idx]
+            for thr in BINARY_THRESHOLDS_MM:
+                ys = metric_history[kind][thr][metric]
+                ax.plot(epochs, ys, label=f">{thr}mm")
+            ax.set_title(f"{kind.replace('_', ' ').title()} - {titles[m_idx]}")
+            ax.set_xlabel("Epoch"); ax.set_ylabel(metric.upper())
+            ax.grid(True)
+            ax.legend(ncol=2, fontsize=8)
+        # 余白埋め
+        if len(metrics_list) < len(axes):
+            axes[-1].axis('off')
+        plt.tight_layout()
+        save_path = os.path.join(out_dir, f"{kind}_metrics_over_epochs.png")
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+        logger.info(f"Saved: {save_path}")
+
+    plot_binary('binary_hourly')
+    plot_binary('binary_sum')
+
+    # 2) Categorical metrics (hourly/sum)
+    class_labels = _class_labels_from_bins(CATEGORY_BINS_MM)
+
+    def plot_categorical(kind):
+        # overall acc
+        plt.figure(figsize=(10, 5))
+        plt.plot(epochs, metric_history[kind]['overall_acc'], 'b-o', label='Overall categorical accuracy')
+        plt.xlabel("Epoch"); plt.ylabel("Accuracy"); plt.title(f"{kind.replace('_', ' ').title()} - Overall categorical accuracy")
+        plt.grid(True); plt.legend()
+        save_path = os.path.join(out_dir, f"{kind}_overall_accuracy_over_epochs.png")
+        plt.savefig(save_path, dpi=150); plt.close()
+        logger.info(f"Saved: {save_path}")
+
+        # per-class precision
+        prec = np.stack(metric_history[kind]['per_class_precision'], axis=0)  # [E, K]
+        plt.figure(figsize=(12, 6))
+        for k in range(prec.shape[1]):
+            plt.plot(epochs, prec[:, k], label=f"class {class_labels[k]}")
+        plt.xlabel("Epoch"); plt.ylabel("Precision"); plt.title(f"{kind.replace('_', ' ').title()} - Per-class precision")
+        plt.grid(True); plt.legend(ncol=3, fontsize=8)
+        save_path = os.path.join(out_dir, f"{kind}_perclass_precision_over_epochs.png")
+        plt.savefig(save_path, dpi=150); plt.close()
+        logger.info(f"Saved: {save_path}")
+
+        # per-class recall
+        rec = np.stack(metric_history[kind]['per_class_recall'], axis=0)  # [E, K]
+        plt.figure(figsize=(12, 6))
+        for k in range(rec.shape[1]):
+            plt.plot(epochs, rec[:, k], label=f"class {class_labels[k]}")
+        plt.xlabel("Epoch"); plt.ylabel("Recall"); plt.title(f"{kind.replace('_', ' ').title()} - Per-class recall")
+        plt.grid(True); plt.legend(ncol=3, fontsize=8)
+        save_path = os.path.join(out_dir, f"{kind}_perclass_recall_over_epochs.png")
+        plt.savefig(save_path, dpi=150); plt.close()
+        logger.info(f"Saved: {save_path}")
+
+    plot_categorical('categorical_hourly')
+    plot_categorical('categorical_sum')
+
+    # 3) RMSE and baseline comparison
+    plt.figure(figsize=(12, 6))
+    plt.plot(epochs, metric_history['rmse']['model_1h'], 'b-o', label='Model 1h RMSE')
+    plt.plot(epochs, metric_history['rmse']['baseline_1h'], 'r--o', label='Equal-split baseline 1h RMSE')
+    plt.xlabel("Epoch"); plt.ylabel("RMSE"); plt.title("1h RMSE vs Equal-split baseline over epochs")
+    plt.grid(True); plt.legend()
+    save_path = os.path.join(out_dir, "rmse_1h_baseline_over_epochs.png")
+    plt.savefig(save_path, dpi=150); plt.close()
+    logger.info(f"Saved: {save_path}")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(epochs, metric_history['rmse']['sum'], 'g-o', label='Sum RMSE')
+    plt.xlabel("Epoch"); plt.ylabel("RMSE"); plt.title("Sum RMSE over epochs")
+    plt.grid(True); plt.legend()
+    save_path = os.path.join(out_dir, "rmse_sum_over_epochs.png")
+    plt.savefig(save_path, dpi=150); plt.close()
+    logger.info(f"Saved: {save_path}")
+
+    # 4) Wet-hour pattern accuracy
+    plt.figure(figsize=(10, 5))
+    plt.plot(epochs, metric_history['wet_hour_pattern']['accuracy'], 'm-o', label='Wet-hour pattern accuracy (0/1/2/3)')
+    plt.xlabel("Epoch"); plt.ylabel("Accuracy"); plt.title("Wet-hour pattern accuracy over epochs")
+    plt.grid(True); plt.legend()
+    save_path = os.path.join(out_dir, "wet_hour_pattern_accuracy_over_epochs.png")
+    plt.savefig(save_path, dpi=150); plt.close()
+    logger.info(f"Saved: {save_path}")
 
 @torch.no_grad()
 def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger):
-    """評価拡張版:
-    - 2値判定: 複数しきい値
-    - カテゴリ分類: binsごとの混同行列(時刻別/積算)
-    - equal-split(積算/3)ベースラインとの比較（1h RMSE）
-    - 「降水あり時間数(0/1/2/3)」のパターン一致評価
-    """
+    """最終モデルの評価（v2仕様: 拡張メトリクスを一括計算）"""
     main_logger.info("Starting final model evaluation (v2)...")
     
     model = SwinTransformerSys(
@@ -455,48 +750,38 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
 
     eval_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
-    # 2値判定用カウンタ（時刻別の全ピクセルを合算）
     bin_stats_hourly = {thr: {'tp':0, 'tn':0, 'fp':0, 'fn':0} for thr in BINARY_THRESHOLDS_MM}
     bin_stats_sum    = {thr: {'tp':0, 'tn':0, 'fp':0, 'fn':0} for thr in BINARY_THRESHOLDS_MM}
 
-    # カテゴリ分類（bins）混同行列（時刻別/積算）
-    K = len(CATEGORY_BINS_MM) - 1  # カテゴリ数
-    confmat_hourly = np.zeros((K, K), dtype=np.int64)  # [true, pred]
+    K = len(CATEGORY_BINS_MM) - 1
+    confmat_hourly = np.zeros((K, K), dtype=np.int64)
     confmat_sum    = np.zeros((K, K), dtype=np.int64)
 
-    # equal-splitベースラインとの比較（1時間ごとRMSE）
-    # モデルの1h RMSEと、積算(モデル予測sum)を3等分したベースラインの1h RMSEを比較
     sse_model_1h = 0.0
     sse_base_1h  = 0.0
     count_1h     = 0
 
-    # 積算RMSE（モデル予測sum vs 正解sum）
     sse_sum = 0.0
     count_sum = 0
 
-    # 3時間のうち降水「あり時間数」パターン(0/1/2/3)の一致評価
-    # confusion_4x4: rows=true_count(0..3), cols=pred_count(0..3)
     conf_wethours = np.zeros((4, 4), dtype=np.int64)
 
     progress_bar = tqdm(eval_loader, desc="Evaluating Model (v2)", leave=False)
     for batch in progress_bar:
         inputs = batch['input'].to(device)
-        targ_1h = batch['target_1h'].to(device)  # (B, 3, H, W)
-        targ_sum = batch['target_sum'].to(device) # (B, 1, H, W)
+        targ_1h = batch['target_1h'].to(device)
+        targ_sum = batch['target_sum'].to(device)
 
         with autocast(device_type='cuda', dtype=torch.float16):
             outputs = model(inputs)
-        outputs = torch.relu(outputs)  # (B, 3, H, W)
+        outputs = torch.relu(outputs)
 
-        # CPUに移してnumpyへ
-        pred_1h = outputs.detach().cpu().numpy()  # (B,3,H,W)
-        true_1h = targ_1h.detach().cpu().numpy()  # (B,3,H,W)
-        pred_sum = outputs.sum(dim=1, keepdim=True).detach().cpu().numpy()  # (B,1,H,W)
-        true_sum = targ_sum.detach().cpu().numpy()  # (B,1,H,W)
-
+        pred_1h = outputs.detach().cpu().numpy()
+        true_1h = targ_1h.detach().cpu().numpy()
+        pred_sum = outputs.sum(dim=1, keepdim=True).detach().cpu().numpy()
+        true_sum = targ_sum.detach().cpu().numpy()
         B, _, H, W = outputs.shape
 
-        # 2値判定（時刻別）：(B,3,H,W)をまとめて評価
         for thr in BINARY_THRESHOLDS_MM:
             tp, tn, fp, fn = _tally_binary(pred_1h, true_1h, thr)
             bin_stats_hourly[thr]['tp'] += int(tp)
@@ -504,7 +789,6 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
             bin_stats_hourly[thr]['fp'] += int(fp)
             bin_stats_hourly[thr]['fn'] += int(fn)
 
-        # 2値判定（積算）
         for thr in BINARY_THRESHOLDS_MM:
             tp, tn, fp, fn = _tally_binary(pred_sum, true_sum, thr)
             bin_stats_sum[thr]['tp'] += int(tp)
@@ -512,52 +796,40 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
             bin_stats_sum[thr]['fp'] += int(fp)
             bin_stats_sum[thr]['fn'] += int(fn)
 
-        # カテゴリ分類（時刻別）
-        # flat化で大容量になりがちなので、時間(3)でループして処理
         for t in range(3):
             true_bins = _digitize_bins(true_1h[:, t, :, :].ravel(), CATEGORY_BINS_MM)
             pred_bins = _digitize_bins(pred_1h[:, t, :, :].ravel(), CATEGORY_BINS_MM)
-            for tb, pb in zip(true_bins, pred_bins):
-                if 0 <= tb < K and 0 <= pb < K:
-                    confmat_hourly[tb, pb] += 1
+            idx = (true_bins >= 0) & (true_bins < K) & (pred_bins >= 0) & (pred_bins < K)
+            tb = true_bins[idx]; pb = pred_bins[idx]
+            np.add.at(confmat_hourly, (tb, pb), 1)
 
-        # カテゴリ分類（積算）
         true_bins_sum = _digitize_bins(true_sum.ravel(), CATEGORY_BINS_MM)
         pred_bins_sum = _digitize_bins(pred_sum.ravel(), CATEGORY_BINS_MM)
-        for tb, pb in zip(true_bins_sum, pred_bins_sum):
-            if 0 <= tb < K and 0 <= pb < K:
-                confmat_sum[tb, pb] += 1
+        idx2 = (true_bins_sum >= 0) & (true_bins_sum < K) & (pred_bins_sum >= 0) & (pred_bins_sum < K)
+        tb2 = true_bins_sum[idx2]; pb2 = pred_bins_sum[idx2]
+        np.add.at(confmat_sum, (tb2, pb2), 1)
 
-        # equal-splitベースライン vs モデルの1hRMSE
-        # ベースライン: pred_sumを3等分して各時間へ
-        base_1h = np.repeat(pred_sum / 3.0, repeats=3, axis=1)  # (B,3,H,W)
+        base_1h = np.repeat(pred_sum / 3.0, repeats=3, axis=1)
         diff_model = (pred_1h - true_1h)
         diff_base  = (base_1h - true_1h)
         sse_model_1h += float(np.sum(diff_model**2))
         sse_base_1h  += float(np.sum(diff_base**2))
         count_1h     += int(B * 3 * H * W)
 
-        # 積算RMSE（モデルsum vs 正解sum）
         diff_sum = (pred_sum - true_sum)
         sse_sum += float(np.sum(diff_sum**2))
         count_sum += int(B * H * W)
 
-        # 「降水あり時間数」(>=WETHOUR_THRESHOLD_MM)のパターン一致評価
         true_wet = (true_1h >= WETHOUR_THRESHOLD_MM)
         pred_wet = (pred_1h >= WETHOUR_THRESHOLD_MM)
-        # 各画素ごとに wet時間数を数える：shape (B,H,W)
         true_count = np.sum(true_wet, axis=1)
         pred_count = np.sum(pred_wet, axis=1)
-        # 0..3にクリップ（安全のため）
         true_count = np.clip(true_count, 0, 3).astype(np.int64).ravel()
         pred_count = np.clip(pred_count, 0, 3).astype(np.int64).ravel()
-        for tc, pc in zip(true_count, pred_count):
-            conf_wethours[tc, pc] += 1
+        np.add.at(conf_wethours, (true_count, pred_count), 1)
 
-    # 指標集計
     epsilon = 1e-6
 
-    # 2値判定の指標（時刻別・積算）
     def compute_binary_metrics(stats):
         out = {}
         for thr, d in stats.items():
@@ -574,12 +846,10 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
     metrics_hourly = compute_binary_metrics(bin_stats_hourly)
     metrics_sum    = compute_binary_metrics(bin_stats_sum)
 
-    # カテゴリ分類の指標（単純に「カテゴリ一致率=対角和/総和」）
     def compute_categorical_metrics(confmat):
         total = confmat.sum()
         diag = np.trace(confmat)
         acc = diag / (total + epsilon)
-        # クラス別の適合率/再現率(参考): 行=真、列=予測
         precisions = []
         recalls = []
         for k in range(confmat.shape[0]):
@@ -595,23 +865,19 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
     cat_acc_hourly, cat_prec_hourly, cat_rec_hourly = compute_categorical_metrics(confmat_hourly)
     cat_acc_sum,    cat_prec_sum,    cat_rec_sum    = compute_categorical_metrics(confmat_sum)
 
-    # RMSE計算
     rmse_model_1h = np.sqrt(sse_model_1h / (count_1h + epsilon))
     rmse_base_1h  = np.sqrt(sse_base_1h  / (count_1h + epsilon))
     rmse_sum      = np.sqrt(sse_sum      / (count_sum + epsilon))
 
-    # wet-hour-countパターンの一致率（対角和/総和）
     total_wh = conf_wethours.sum()
     diag_wh = np.trace(conf_wethours)
     acc_wethour_pattern = diag_wh / (total_wh + epsilon)
 
-    # 結果をログへ書き出し
     with open(eval_log_path, 'a', encoding='utf-8') as f:
         f.write("="*70 + "\n")
         f.write("Final Model Evaluation (v2) with extended metrics\n")
         f.write("="*70 + "\n\n")
 
-        # 2値判定（時刻別）
         f.write("[Binary Metrics - Hourly (per-pixel over all 3 hours)]\n")
         for thr in BINARY_THRESHOLDS_MM:
             m = metrics_hourly[thr]
@@ -620,7 +886,6 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
                     f"(TP={m['tp']}, TN={m['tn']}, FP={m['fp']}, FN={m['fn']})\n")
         f.write("\n")
 
-        # 2値判定（積算）
         f.write("[Binary Metrics - Accumulation (sum over 3 hours)]\n")
         for thr in BINARY_THRESHOLDS_MM:
             m = metrics_sum[thr]
@@ -629,31 +894,22 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
                     f"(TP={m['tp']}, TN={m['tn']}, FP={m['fp']}, FN={m['fn']})\n")
         f.write("\n")
 
-        # カテゴリ分類（時刻別）
         f.write("[Categorical Metrics - Hourly]\n")
         f.write(f"Bins (mm): {CATEGORY_BINS_MM}\n")
         f.write(f"Overall categorical accuracy: {cat_acc_hourly:.4f}\n")
-        f.write("Confusion Matrix [true x pred]:\n")
-        for i in range(K):
-            f.write(" ".join(str(v) for v in confmat_hourly[i, :]) + "\n")
         f.write("Per-class precision:\n")
         f.write(" ".join(f"{x:.4f}" for x in cat_prec_hourly) + "\n")
         f.write("Per-class recall:\n")
         f.write(" ".join(f"{x:.4f}" for x in cat_rec_hourly) + "\n\n")
 
-        # カテゴリ分類（積算）
         f.write("[Categorical Metrics - Accumulation]\n")
         f.write(f"Bins (mm): {CATEGORY_BINS_MM}\n")
         f.write(f"Overall categorical accuracy: {cat_acc_sum:.4f}\n")
-        f.write("Confusion Matrix [true x pred]:\n")
-        for i in range(K):
-            f.write(" ".join(str(v) for v in confmat_sum[i, :]) + "\n")
         f.write("Per-class precision:\n")
         f.write(" ".join(f"{x:.4f}" for x in cat_prec_sum) + "\n")
         f.write("Per-class recall:\n")
         f.write(" ".join(f"{x:.4f}" for x in cat_rec_sum) + "\n\n")
 
-        # equal-splitベースラインとの比較（1h RMSE）
         f.write("[Equal-split Baseline Comparison - 1h RMSE]\n")
         f.write("Baseline definition: split model's predicted accumulation equally into 3 hours.\n")
         f.write(f"Model 1h RMSE: {rmse_model_1h:.6f}\n")
@@ -661,17 +917,11 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
         better = "BETTER than" if rmse_model_1h < rmse_base_1h else "NOT better than"
         f.write(f"Result: Model is {better} the equal-split baseline (lower is better).\n\n")
 
-        # 積算RMSE
         f.write("[Accumulation RMSE]\n")
         f.write(f"Sum RMSE (model sum vs. true sum): {rmse_sum:.6f}\n\n")
 
-        # 「降水あり時間数(0/1/2/3)」のパターン一致率
         f.write("[Wet-hour count pattern (0/1/2/3) - Consistency]\n")
         f.write(f"Overall pattern accuracy: {acc_wethour_pattern:.4f}\n")
-        f.write("Confusion Matrix [true_count x pred_count]:\n")
-        for i in range(4):
-            f.write(" ".join(str(v) for v in conf_wethours[i, :]) + "\n")
-        f.write("\n")
 
     main_logger.info(f"Evaluation (v2) finished. Results saved to '{eval_log_path}'")
 
@@ -720,10 +970,22 @@ def main_worker(rank, world_size, train_files, valid_files):
         'train_loss': [], 'train_1h_rmse': [], 'train_sum_rmse': [],
         'val_loss': [], 'val_1h_rmse': [], 'val_sum_rmse': []
     }
+
+    # 追加: エポックごとのメトリクス履歴
+    # バイナリ（時刻別・積算）: 各thresholdごとに各メトリクスのリスト
+    metric_history = {
+        'num_epochs': NUM_EPOCHS,
+        'binary_hourly': {thr: {'accuracy': [], 'precision': [], 'recall': [], 'f1': [], 'csi': []} for thr in BINARY_THRESHOLDS_MM},
+        'binary_sum': {thr: {'accuracy': [], 'precision': [], 'recall': [], 'f1': [], 'csi': []} for thr in BINARY_THRESHOLDS_MM},
+        'categorical_hourly': {'overall_acc': [], 'per_class_precision': [], 'per_class_recall': []},
+        'categorical_sum': {'overall_acc': [], 'per_class_precision': [], 'per_class_recall': []},
+        'rmse': {'model_1h': [], 'baseline_1h': [], 'sum': []},
+        'wet_hour_pattern': {'accuracy': []}
+    }
     
     for epoch in range(NUM_EPOCHS):
         train_losses = train_one_epoch(rank, model, train_loader, optimizer, scaler, epoch, exec_log_path)
-        val_losses = validate_one_epoch(rank, model, valid_loader, epoch, exec_log_path)
+        val_losses, val_metrics = validate_one_epoch(rank, model, valid_loader, epoch, exec_log_path)
         scheduler.step()
         
         loss_history['train_loss'].append(train_losses[0]); loss_history['train_1h_rmse'].append(train_losses[1]); loss_history['train_sum_rmse'].append(train_losses[2])
@@ -733,6 +995,25 @@ def main_worker(rank, world_size, train_files, valid_files):
             main_log.info(f"--- Epoch {epoch+1}/{NUM_EPOCHS} ---")
             main_log.info(f"Train Loss: {train_losses[0]:.4f} (1h_rmse: {train_losses[1]:.4f}, sum_rmse: {train_losses[2]:.4f})")
             main_log.info(f"Valid Loss: {val_losses[0]:.4f} (1h_rmse: {val_losses[1]:.4f}, sum_rmse: {val_losses[2]:.4f})")
+
+            # 追加: エポックごとの拡張メトリクスの記録
+            if val_metrics is not None:
+                for thr in BINARY_THRESHOLDS_MM:
+                    for mname in ['accuracy', 'precision', 'recall', 'f1', 'csi']:
+                        metric_history['binary_hourly'][thr][mname].append(val_metrics['binary_hourly'][thr][mname])
+                        metric_history['binary_sum'][thr][mname].append(val_metrics['binary_sum'][thr][mname])
+                # カテゴリ（時刻別/積算）
+                metric_history['categorical_hourly']['overall_acc'].append(val_metrics['categorical_hourly']['overall_acc'])
+                metric_history['categorical_hourly']['per_class_precision'].append(val_metrics['categorical_hourly']['per_class_precision'])
+                metric_history['categorical_hourly']['per_class_recall'].append(val_metrics['categorical_hourly']['per_class_recall'])
+                metric_history['categorical_sum']['overall_acc'].append(val_metrics['categorical_sum']['overall_acc'])
+                metric_history['categorical_sum']['per_class_precision'].append(val_metrics['categorical_sum']['per_class_precision'])
+                metric_history['categorical_sum']['per_class_recall'].append(val_metrics['categorical_sum']['per_class_recall'])
+                # RMSEとWet-hour
+                metric_history['rmse']['model_1h'].append(val_metrics['rmse']['model_1h'])
+                metric_history['rmse']['baseline_1h'].append(val_metrics['rmse']['baseline_1h'])
+                metric_history['rmse']['sum'].append(val_metrics['rmse']['sum'])
+                metric_history['wet_hour_pattern']['accuracy'].append(val_metrics['wet_hour_pattern']['accuracy'])
             
             if val_losses[0] < best_val_loss:
                 best_val_loss = val_losses[0]
@@ -750,10 +1031,14 @@ def main_worker(rank, world_size, train_files, valid_files):
     dist.barrier()
 
     if rank == 0:
+        # 既存の損失曲線
         plot_loss_curve(loss_history, PLOT_SAVE_PATH, main_log, best_epoch)
-        # v2: 拡張評価を実施
+        # 追加: エポックメトリクスの図
+        plot_epoch_metrics(metric_history, EPOCH_METRIC_PLOT_DIR, main_log)
+        # v2: 拡張評価（最終モデル）
         evaluate_model(MODEL_SAVE_PATH, valid_dataset, torch.device(f"cuda:{rank}"), EVALUATION_LOG_PATH, main_log)
         main_log.info(f"Result images saved in '{RESULT_IMG_DIR}/'.")
+        main_log.info(f"Epoch metrics plots saved in '{EPOCH_METRIC_PLOT_DIR}/'.")
         main_log.info("All processes finished successfully.")
     
     cleanup_ddp()
