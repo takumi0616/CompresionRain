@@ -65,7 +65,7 @@ EPOCH_METRIC_PLOT_DIR = os.path.join(RESULT_DIR, 'epoch_metrics_plots_v2')
 NUM_WORKERS = 0
 
 # --- 学習パラメータ ---
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 NUM_EPOCHS = 50
 LEARNING_RATE = 1e-4
 
