@@ -69,7 +69,7 @@ EPOCH_METRIC_PLOT_DIR = os.path.join(RESULT_DIR, 'epoch_metrics_plots_v3')
 VIDEO_OUTPUT_PATH = os.path.join(RESULT_DIR, 'validation_results_v3.mp4')
 VIDEO_FPS = 2  # 0.5秒/枚 = 2fps
 
-NUM_WORKERS = 0
+NUM_WORKERS = 1
 
 # --- 学習パラメータ ---
 BATCH_SIZE = 8
@@ -77,7 +77,7 @@ NUM_EPOCHS = 50
 LEARNING_RATE = 1e-4
 
 # --- 再現性確保のための乱数シード設定 ---
-RANDOM_SEED = 40
+RANDOM_SEED = 1
 
 # --- モデルパラメータ ---
 IMG_SIZE = 480
