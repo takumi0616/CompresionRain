@@ -69,7 +69,7 @@ EPOCH_METRIC_PLOT_DIR = os.path.join(RESULT_DIR, 'epoch_metrics_plots_v3')
 VIDEO_OUTPUT_PATH = os.path.join(RESULT_DIR, 'validation_results_v3.mp4')
 VIDEO_FPS = 2  # 0.5秒/枚 = 2fps
 
-NUM_WORKERS = 1
+NUM_WORKERS = 0
 
 # --- 学習パラメータ ---
 BATCH_SIZE = 8
@@ -1151,6 +1151,19 @@ if __name__ == '__main__':
     os.makedirs(RESULT_DIR, exist_ok=True)
     
     main_logger, _ = setup_loggers()
+
+    main_logger.info("Cartopyの地図データを事前にダウンロードします...")
+    try:
+        # ダミーのプロットを作成して、COASTLINEとBORDERSのデータをダウンロードさせる
+        # これにより、並列プロセスが同時にダウンロードするのを防ぐ
+        fig_pre = plt.figure()
+        ax_pre = plt.axes(projection=ccrs.PlateCarree())
+        ax_pre.add_feature(cfeature.COASTLINE)
+        ax_pre.add_feature(cfeature.BORDERS)
+        plt.close(fig_pre)
+        main_logger.info("Cartopyのデータダウンロードが完了しました。")
+    except Exception as e:
+        main_logger.warning(f"Cartopyのデータ事前ダウンロード中にエラーが発生しました: {e}")
 
     main_logger.info(f"データディレクトリ: {DATA_DIR}")
     main_logger.info(f"現在の作業ディレクトリ: {os.getcwd()}")

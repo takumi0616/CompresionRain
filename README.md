@@ -13,6 +13,8 @@ nohup python3 convert_nc.py > convert_nc.log 2>&1 &
 
 nohup python3 check_MSM_data_nc.py > check_MSM_data_nc.log 2>&1 &
 
+nohup python swinunet_main_v3.py > swinunet_main_v3.log 2>&1 &
+
 ```
 
 タスクの削除
@@ -27,6 +29,8 @@ pkill -f "convert_data_v1.py"
 pkill -f "convert_msm_data.py"
 
 pkill -f "convert_nc.py"
+
+pkill -f "swinunet_main_v3.py"
 ```
 
 ```bash
@@ -40,4 +44,10 @@ DDP による GPU エラー時のコマンド
 
 ```bash
 sudo kill -9 1493785
+```
+
+## gpu01 → mac
+
+```bash
+rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/CompresionRain/swin-unet_main_result_v3 /Users/takumi0616/Develop/docker_miniconda/src/CompresionRain/result_gpu01
 ```
