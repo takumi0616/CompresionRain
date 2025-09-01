@@ -557,6 +557,9 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
 @torch.no_grad()
 def visualize_final_results(rank, world_size, valid_dataset, best_model_path, result_img_dir, main_logger, exec_log_path):
     """検証データ全体での可視化: 2x4配置(左に積算 予測/正解 + 各時刻 予測/正解)、LogNormで見やすく"""
+    # DDP安全化: 可視化はrank 0のみで実行（Cartopyの同時アクセスを回避）
+    if rank != 0:
+        return
     if not CARTOPY_AVAILABLE:
         if rank == 0:
             main_logger.warning("Cartopyが見つからないため、最終的な可視化をスキップします。")
@@ -575,8 +578,8 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
         os.makedirs(result_img_dir, exist_ok=True)
         main_logger.info(f"[v4] 検証データ全体に対する可視化を開始 (モデル: {os.path.basename(best_model_path)})")
     
-    indices = list(range(len(valid_dataset)))
-    proc_indices = indices[rank::world_size]
+    # rank 0のみで全インデックスを処理
+    proc_indices = list(range(len(valid_dataset)))
 
     lon = valid_dataset.ds['lon'].values
     lat = valid_dataset.ds['lat'].values
@@ -649,8 +652,24 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             plt.tight_layout(rect=[0, 0.03, 1, 0.96])
             time_str = np.datetime_as_string(time_val, unit='h').replace(':', '-').replace('T', '_')
             save_path = os.path.join(result_img_dir, f'validation_{time_str}.png')
-            plt.savefig(save_path, dpi=150)
-            plt.close(fig)
+            try:
+                plt.savefig(save_path, dpi=150)
+            except Exception as e:
+                if main_logger:
+                    main_logger.warning(f"Cartopy描画でエラーが発生したため、地図レイヤを外して保存を再試行します: {e}")
+                plt.close(fig)
+                # フォールバック: Cartopyを使わない通常のAxesで再描画
+                fig2, axes2 = plt.subplots(2, 4, figsize=(24, 12))
+                fig2.suptitle(f"Validation Time: {np.datetime_as_string(time_val, unit='m')}", fontsize=16)
+                for i, ax2 in enumerate(axes2.flat):
+                    im2 = ax2.imshow(plot_data[i], origin='upper', cmap=cmap, norm=norm)
+                    ax2.set_title(titles[i])
+                    fig2.colorbar(im2, ax=ax2, shrink=0.7, label='Precipitation (mm) [Log scale]')
+                plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+                plt.savefig(save_path, dpi=150)
+                plt.close(fig2)
+            else:
+                plt.close(fig)
 
 def plot_loss_curve(history, save_path, logger, best_epoch):
     plt.figure(figsize=(12, 8))
