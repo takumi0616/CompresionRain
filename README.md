@@ -17,6 +17,7 @@ notify-run gpu01 -- nohup python swinunet_main_v3.py > swinunet_main_v3.log 2>&1
 
 notify-run gpu01 -- nohup python swinunet_main_v4.py > swinunet_main_v4.log 2>&1 &
 
+notify-run gpu01 -- nohup python swinunet_main_v5.py > swinunet_main_v5.log 2>&1 &
 ```
 
 タスクの削除
@@ -35,6 +36,8 @@ pkill -f "convert_nc.py"
 pkill -f "swinunet_main_v3.py"
 
 pkill -f "swinunet_main_v4.py"
+
+pkill -f "swinunet_main_v5.py"
 ```
 
 ```bash
