@@ -31,6 +31,7 @@ from tqdm import tqdm
 import logging
 import sys
 import random
+from bisect import bisect_right
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
@@ -70,7 +71,7 @@ EPOCH_METRIC_PLOT_DIR = os.path.join(RESULT_DIR, 'epoch_metrics_plots_v5')
 VIDEO_OUTPUT_PATH = os.path.join(RESULT_DIR, 'validation_results_v5.mp4')
 VIDEO_FPS = 2  # 0.5秒/枚 = 2fps
 
-NUM_WORKERS = 0
+NUM_WORKERS = 4
 
 # --- 学習パラメータ ---
 BATCH_SIZE = 8
@@ -117,7 +118,7 @@ ENABLE_INTENSITY_WEIGHTED_LOSS = True  # Trueで有効化
 # 1時間降水の重み（ビン境界と各ビンの重み）
 # 境界は [1, 5, 10, 20, 30, 50]（右開区間）。重みは len(boundaries)+1 個。
 INTENSITY_WEIGHT_BINS_1H = [1.0, 5.0, 10.0, 20.0, 30.0, 50.0]  # mm/h
-INTENSITY_WEIGHT_VALUES_1H = [0.1, 1.0, 3.0, 10.0, 70.0, 200.0, 800.0]
+INTENSITY_WEIGHT_VALUES_1H = [1.0, 1.1, 1.3, 2.2, 9.7, 25.7, 100.0]
 
 # 3時間積算（sum）は1hの2倍スケールのビン境界＋段階的な整数重み（頻度不均衡の緩和）
 # 例: 1hの50mmに対してsumは100mmまで（2倍スケール）
@@ -193,6 +194,13 @@ def cleanup_ddp():
 # 4. データセットクラスの定義
 # ==============================================================================
 class NetCDFDataset(Dataset):
+    """
+    メモリ常駐を避け、SSD上のNetCDFから必要な時刻スライスだけをオンデマンドで読み込む実装。
+    - 全ファイルをまとめて open_mfdataset せず、各ファイルの time 長だけをメタデータとして保持
+    - __getitem__ では (グローバルidx) -> (対象ファイル, ローカルidx) に変換し、そのスライスのみを読み込み
+    - 直近の1ファイルだけを開いたままキャッシュし、ファイルを跨いだら前のハンドルを閉じる
+    これにより、巨大配列をRAMに展開せず、SSDからの逐次I/O中心で動作します。
+    """
     def __init__(self, file_paths, logger=None):
         super().__init__()
         self.logger = logger if logger else logging.getLogger('main')
@@ -201,41 +209,119 @@ class NetCDFDataset(Dataset):
         for fp in file_paths:
             if not os.path.exists(fp):
                 raise FileNotFoundError(f"ファイルが見つかりません: {fp}")
-        self.logger.info(f"NetCDFDataset: {len(file_paths)} 個のファイルを読み込み中...")
+
+        self.files = list(file_paths)
+        self._cache_path = None
+        self._cache_ds = None
+
+        # 画像サイズは先頭ファイルから取得（lat/lon次元は全ファイルで同一前提）
+        with xr.open_dataset(self.files[0], engine='netcdf4', lock=False) as ds0:
+            self.img_dims = (ds0.sizes['lat'], ds0.sizes['lon'])
+            self.lon = ds0['lon'].values
+            self.lat = ds0['lat'].values
+
+        # 各ファイルの time 長を取得（メタデータのみ）
+        self.file_time_lens = []
+        for fp in self.files:
+            with xr.open_dataset(fp, engine='netcdf4', lock=False) as ds_meta:
+                self.file_time_lens.append(int(ds_meta.sizes['time']))
+
+        # 累積長（2分探索で (idx -> file) を即時変換）
+        self.cum_counts = np.cumsum(self.file_time_lens).tolist()
+        self.time_len = self.cum_counts[-1]
+
+        self.logger.info(f"NetCDFDataset: {len(self.files)} 個のファイルをインデックス化（オンデマンド読み込み）。")
+        self.logger.info(f"データセット初期化完了: 総時間ステップ数={self.time_len}, 画像サイズ={self.img_dims}")
+
+    def __del__(self):
         try:
-            self.ds = xr.open_mfdataset(
-                file_paths, chunks={}, parallel=False, combine='by_coords',
-                engine='netcdf4', lock=False
-            )
-        except Exception as e:
-            self.logger.error(f"xarray.open_mfdatasetでの読み込みに失敗: {e}")
-            raise
-        self.time_len = len(self.ds['time'])
-        self.img_dims = (self.ds.sizes['lat'], self.ds.sizes['lon'])
-        self.logger.info(f"データセット初期化完了: 時間ステップ数={self.time_len}, 画像サイズ={self.img_dims}")
-    
+            if self._cache_ds is not None:
+                self._cache_ds.close()
+        except Exception:
+            pass
+
+    def _get_ds(self, path):
+        """直近1ファイルのみ開いたままにする簡易キャッシュ"""
+        if self._cache_path == path and self._cache_ds is not None:
+            return self._cache_ds
+        # 切り替え時に前のDSを閉じる
+        if self._cache_ds is not None:
+            try:
+                self._cache_ds.close()
+            except Exception:
+                pass
+            self._cache_ds = None
+            self._cache_path = None
+        self._cache_ds = xr.open_dataset(path, engine='netcdf4', lock=False)
+        self._cache_path = path
+        return self._cache_ds
+
     def __len__(self):
         return self.time_len
-    
+
+    def global_to_file_index(self, idx: int):
+        """グローバルidx -> (ファイルパス, ローカルidx, ファイル番号) を返す"""
+        if idx < 0:
+            idx += self.time_len
+        if idx < 0 or idx >= self.time_len:
+            raise IndexError("Index out of range")
+        file_idx = bisect_right(self.cum_counts, idx)
+        prev_cum = self.cum_counts[file_idx - 1] if file_idx > 0 else 0
+        local_idx = idx - prev_cum
+        return self.files[file_idx], local_idx, file_idx
+
+    def get_time(self, idx: int):
+        """グローバルidxの time 値（numpy.datetime64）を返す"""
+        fpath, local_idx, _ = self.global_to_file_index(idx)
+        ds = self._get_ds(fpath)
+        return ds['time'].isel(time=local_idx).values
+
     def __getitem__(self, idx):
-        sample = self.ds.isel(time=idx).load()
+        # マイナスidx対応
+        if idx < 0:
+            idx += self.time_len
+        if idx < 0 or idx >= self.time_len:
+            raise IndexError("Index out of range")
+
+        # どのファイルに属するか（二分探索）
+        file_idx = bisect_right(self.cum_counts, idx)
+        prev_cum = self.cum_counts[file_idx - 1] if file_idx > 0 else 0
+        local_idx = idx - prev_cum
+        fpath = self.files[file_idx]
+
+        ds = self._get_ds(fpath)
+        sample = ds.isel(time=local_idx)  # .load()は呼ばない（必要スライスだけを読む）
+
+        # 入力チャネルをオンデマンドに読み出し
         input_channels = []
         for var in INPUT_VARS_COMMON:
-            input_channels.append(np.nan_to_num(sample[f'{var}_ft3'].values))
-            input_channels.append(np.nan_to_num(sample[f'{var}_ft6'].values))
+            v3 = np.nan_to_num(sample[f'{var}_ft3'].values).astype(np.float32, copy=False)
+            v6 = np.nan_to_num(sample[f'{var}_ft6'].values).astype(np.float32, copy=False)
+            input_channels.append(v3)
+            input_channels.append(v6)
         for var in INPUT_VARS_PREC:
-            input_channels.append(np.nan_to_num(sample[var].values))
+            vv = np.nan_to_num(sample[var].values).astype(np.float32, copy=False)
+            input_channels.append(vv)
+
+        # 時間特徴はスカラーを HxW に複製（RAM使用は小さい）
         h, w = self.img_dims
         for tvar in TIME_VARS:
-            val = sample[tvar].item()
+            val = float(sample[tvar].values.item())
             channel = np.full((h, w), val, dtype=np.float32)
             input_channels.append(channel)
-        input_tensor = torch.from_numpy(np.stack(input_channels, axis=0)).float()
-        
-        target_1h_channels = [np.nan_to_num(sample[var].values) for var in TARGET_VARS_1H]
-        target_1h_tensor = torch.from_numpy(np.stack(target_1h_channels, axis=0)).float()
-        target_sum_tensor = torch.from_numpy(np.nan_to_num(sample[TARGET_VAR_SUM].values)).float().unsqueeze(0)
-        
+
+        input_tensor = torch.from_numpy(np.stack(input_channels, axis=0))
+
+        # ターゲット（1h×3 + 3h積算）
+        target_1h_channels = []
+        for var in TARGET_VARS_1H:
+            tt = np.nan_to_num(sample[var].values).astype(np.float32, copy=False)
+            target_1h_channels.append(tt)
+        target_1h_tensor = torch.from_numpy(np.stack(target_1h_channels, axis=0))
+        target_sum_tensor = torch.from_numpy(
+            np.nan_to_num(sample[TARGET_VAR_SUM].values).astype(np.float32, copy=False)
+        ).unsqueeze(0)
+
         return {"input": input_tensor, "target_1h": target_1h_tensor, "target_sum": target_sum_tensor}
 
 # ==============================================================================
@@ -589,8 +675,8 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
     # rank 0のみで全インデックスを処理
     proc_indices = list(range(len(valid_dataset)))
 
-    lon = valid_dataset.ds['lon'].values
-    lat = valid_dataset.ds['lat'].values
+    lon = valid_dataset.lon
+    lat = valid_dataset.lat
     map_extent = [lon.min(), lon.max(), lat.min(), lat.max()]
     
     with open(exec_log_path, 'a', encoding='utf-8') as log_file:
@@ -633,7 +719,7 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
 
             # 2行4列の図: 上段(予測: 積算, ft+4, ft+5, ft+6) 下段(正解: 積算, ft+4, ft+5, ft+6)
             fig, axes = plt.subplots(2, 4, figsize=(24, 12), subplot_kw={'projection': ccrs.PlateCarree()})
-            time_val = valid_dataset.ds.time.values[idx]
+            time_val = valid_dataset.get_time(idx)
             fig.suptitle(f"Validation Time: {np.datetime_as_string(time_val, unit='m')}", fontsize=16)
 
             plot_data = [
