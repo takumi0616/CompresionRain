@@ -1120,7 +1120,7 @@ def create_video_from_images(image_dir, output_path, fps, logger):
 
     logger.info(f"動画作成を開始: フレーム数={len(files)}, fps={fps}, 出力='{output_path}'")
     try:
-        writer = imageio.get_writer(output_path, fps=fps, codec='libx264', quality=8, pixelformat='yuv520p')
+        writer = imageio.get_writer(output_path, fps=fps, codec='libx264', quality=8, pixelformat='yuv420p')
         for i, fpath in enumerate(files):
             frame = imageio.imread(fpath)
             writer.append_data(frame)
