@@ -17,8 +17,10 @@ notify-run gpu01 -- nohup python swinunet_main_v3.py > swinunet_main_v3.log 2>&1
 
 notify-run gpu01 -- nohup python swinunet_main_v4.py > swinunet_main_v4.log 2>&1 &
 
-notify-run gpu01 -- nohup python swinunet_main_v5.py > swinunet_main_v5.log 2>&1 &
+notify-run gpu01 -- nohup python separate_main_v1.py > separate_main_v1.log 2>&1 &
 ```
+
+src/CompresionRain/separate_main_v1.py
 
 タスクの削除
 
@@ -37,7 +39,7 @@ pkill -f "swinunet_main_v3.py"
 
 pkill -f "swinunet_main_v4.py"
 
-pkill -f "swinunet_main_v5.py"
+pkill -f "separate_main_v1.py"
 ```
 
 ```bash

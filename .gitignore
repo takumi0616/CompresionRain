@@ -9,3 +9,4 @@ trash/
 *.pth
 *.png
 *.mp4
+result_*/

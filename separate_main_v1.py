@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# swinunet_main_v5.py
-# 変更点(v5):
-# - 評価・可視化の「1h」と「3h積算(sum)」で閾値ビンを分離（sumは1hの2倍スケール）
-# - 損失関数の重み付けを「1h」と「sum」で分離
-#   * 1h（3チャネル）は強度重み付きMSE（従来通りのビンと重み）
-#   * sum（3時間積算）はビン境界を1hの2倍に設定し、頻度不均衡を緩和するための段階的な整数重みを導入
-# - v3の機能（DDP、詳細メトリクス、可視化、動画化など）はすべて踏襲
-# - 保存先ディレクトリやログのバージョン表記をv5に更新
+# ratio-model (Swin-UNet)
+# 目的:
+# - 既知の3時間積算降水量 S=Prec_4_6h_sum を拘束条件とし、t+4/t+5/t+6 の配分比率 w=(w4,w5,w6) を各画素ごとに予測
+# - 予測1時間値は pred_1h = softmax(logits) * S で復元（非負・和=1）。水収支（Σ pred_1h = S）を厳密に満たす
+# 主要点:
+# - モデル出力はlogits(3ch)。チャネル方向softmaxで比率化
+# - 損失は量のMSE（強度重み付き; v5の設定を踏襲）＋任意の比率KL（S>0のみ）
+# - 既存の評価/可視化系は維持（equal-splitとの比較など）。動画化は削除しシンプル化
 
 import os
 import glob
 import warnings
-import hdf5plugin
 import matplotlib.pyplot as plt
+import hdf5plugin  # noqa: F401  # register external HDF5 filters for h5netcdf
 import matplotlib.cm as cm
 from matplotlib.colors import LogNorm
 import numpy as np
@@ -35,9 +35,7 @@ from bisect import bisect_right
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
-# 画像→動画化用（imageioが未インストールの場合はスキップ）
-import imageio.v2 as imageio
-IMAGEIO_AVAILABLE = True
+# 可視化可否フラグ
 CARTOPY_AVAILABLE = True
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -53,29 +51,25 @@ DATA_DIR = './optimization_nc'
 TRAIN_YEARS = [2018, 2019, 2020, 2021]
 VALID_YEARS = [2022]
 
-# --- 結果の保存先ディレクトリ（v5） ---
-RESULT_DIR = 'swin-unet_main_result_v5'
+# --- 結果の保存先ディレクトリ（ratio） ---
+RESULT_DIR = 'swin-unet_ratio_result'
 
-# モデル、プロット、ログの保存先パス（v5）
-MODEL_SAVE_PATH = os.path.join(RESULT_DIR, 'best_swin_unet_model_ddp_monthly_v5.pth')
-PLOT_SAVE_PATH = os.path.join(RESULT_DIR, 'loss_curve_monthly_v5.png')
-RESULT_IMG_DIR = os.path.join(RESULT_DIR, 'result_images_monthly_v5')
-MAIN_LOG_PATH = os.path.join(RESULT_DIR, 'main_v5.log')
-EXEC_LOG_PATH = os.path.join(RESULT_DIR, 'execution_v5.log')
-EVALUATION_LOG_PATH = os.path.join(RESULT_DIR, 'evaluation_v5.log')
+# モデル、プロット、ログの保存先パス（ratio）
+MODEL_SAVE_PATH = os.path.join(RESULT_DIR, 'best_swin_unet_model_ratio.pth')
+PLOT_SAVE_PATH = os.path.join(RESULT_DIR, 'loss_curve_ratio.png')
+RESULT_IMG_DIR = os.path.join(RESULT_DIR, 'result_images_ratio')
+MAIN_LOG_PATH = os.path.join(RESULT_DIR, 'main_ratio.log')
+EXEC_LOG_PATH = os.path.join(RESULT_DIR, 'execution_ratio.log')
+EVALUATION_LOG_PATH = os.path.join(RESULT_DIR, 'evaluation_ratio.log')
 
-# 追加: エポックメトリクスの図出力ディレクトリ（v5）
-EPOCH_METRIC_PLOT_DIR = os.path.join(RESULT_DIR, 'epoch_metrics_plots_v5')
-
-# 追加: 画像→動画の出力先（v5）
-VIDEO_OUTPUT_PATH = os.path.join(RESULT_DIR, 'validation_results_v5.mp4')
-VIDEO_FPS = 2  # 0.5秒/枚 = 2fps
+# 追加: エポックメトリクスの図出力ディレクトリ（ratio）
+EPOCH_METRIC_PLOT_DIR = os.path.join(RESULT_DIR, 'epoch_metrics_plots_ratio')
 
 NUM_WORKERS = 4
 
 # --- 学習パラメータ ---
 BATCH_SIZE = 8
-NUM_EPOCHS = 60
+NUM_EPOCHS = 50
 LEARNING_RATE = 1e-4
 
 # --- 再現性確保のための乱数シード設定 ---
@@ -118,13 +112,16 @@ ENABLE_INTENSITY_WEIGHTED_LOSS = True  # Trueで有効化
 # 1時間降水の重み（ビン境界と各ビンの重み）
 # 境界は [1, 5, 10, 20, 30, 50]（右開区間）。重みは len(boundaries)+1 個。
 INTENSITY_WEIGHT_BINS_1H = [1.0, 5.0, 10.0, 20.0, 30.0, 50.0]  # mm/h
-INTENSITY_WEIGHT_VALUES_1H = [1.0, 1.1, 1.3, 2.2, 9.7, 25.7, 100.0]
+INTENSITY_WEIGHT_VALUES_1H = [1.0, 1.5, 2.0, 4.0, 6.0, 8.0, 10.0]
 
 # 3時間積算（sum）は1hの2倍スケールのビン境界＋段階的な整数重み（頻度不均衡の緩和）
 # 例: 1hの50mmに対してsumは100mmまで（2倍スケール）
 INTENSITY_WEIGHT_BINS_SUM = [2.0, 10.0, 20.0, 40.0, 60.0, 100.0]  # mm/3h
 # 不均衡を考慮した穏やかな昇順の整数重み（過度に大きな係数は避けつつ、強雨ほど重視）
-INTENSITY_WEIGHT_VALUES_SUM = [1.0, 2.0, 3.0, 6.0, 9.0, 12.0, 16.0]
+INTENSITY_WEIGHT_VALUES_SUM = [1.0, 1.5, 2.0, 4.0, 6.0, 8.0, 10.0]
+# 比率モデル用の追加ハイパラ
+RATIO_LOSS_WEIGHT = 0.2  # 比率KLの重み（0で無効）
+EPS = 1e-6
 
 # ==============================================================================
 # 1.5. 再現性確保のための関数
@@ -193,6 +190,24 @@ def cleanup_ddp():
 # ==============================================================================
 # 4. データセットクラスの定義
 # ==============================================================================
+def open_dataset_robust(path, logger):
+    """
+    h5netcdf (with hdf5plugin) を優先し、失敗時は netcdf4 にフォールバック。
+    """
+    try:
+        ds = xr.open_dataset(path, engine='h5netcdf')
+        return ds
+    except Exception as e1:
+        if logger:
+            logger.warning(f"h5netcdfで開けませんでした。netcdf4にフォールバックします: {path} ({e1})")
+        try:
+            ds = xr.open_dataset(path, engine='netcdf4', lock=False)
+            return ds
+        except Exception as e2:
+            if logger:
+                logger.error(f"netCDFを開けませんでした: {path} ({e2})")
+            raise
+
 class NetCDFDataset(Dataset):
     """
     メモリ常駐を避け、SSD上のNetCDFから必要な時刻スライスだけをオンデマンドで読み込む実装。
@@ -215,7 +230,7 @@ class NetCDFDataset(Dataset):
         self._cache_ds = None
 
         # 画像サイズは先頭ファイルから取得（lat/lon次元は全ファイルで同一前提）
-        with xr.open_dataset(self.files[0], engine='netcdf4', lock=False) as ds0:
+        with open_dataset_robust(self.files[0], self.logger) as ds0:
             self.img_dims = (ds0.sizes['lat'], ds0.sizes['lon'])
             self.lon = ds0['lon'].values
             self.lat = ds0['lat'].values
@@ -223,7 +238,7 @@ class NetCDFDataset(Dataset):
         # 各ファイルの time 長を取得（メタデータのみ）
         self.file_time_lens = []
         for fp in self.files:
-            with xr.open_dataset(fp, engine='netcdf4', lock=False) as ds_meta:
+            with open_dataset_robust(fp, self.logger) as ds_meta:
                 self.file_time_lens.append(int(ds_meta.sizes['time']))
 
         # 累積長（2分探索で (idx -> file) を即時変換）
@@ -252,7 +267,7 @@ class NetCDFDataset(Dataset):
                 pass
             self._cache_ds = None
             self._cache_path = None
-        self._cache_ds = xr.open_dataset(path, engine='netcdf4', lock=False)
+        self._cache_ds = open_dataset_robust(path, self.logger)
         self._cache_path = path
         return self._cache_ds
 
@@ -355,29 +370,64 @@ def _weighted_mse(pred, target, bin_edges, weight_values, eps=1e-8):
 
 def custom_loss_function(output, targets):
     """
-    v5: 1hは強度重み付きMSE、sumも2倍スケールのビン＋整数重みで強度重み付きMSEを適用。
-        （ログ用RMSEは従来通り、非加重MSEから算出）
+    ratio-model: 出力logitsをsoftmaxで比率w(3ch)に変換し、既知の3h積算Sでスケールして1h量を復元。
+    数値安定性確保のため、損失計算はfloat32で実施し、log/除算はclamp/正規化を入れる。
+    量の重み付きMSE + （任意）比率KLを採用。ログ用RMSEは非加重RMSE。
     """
-    output = torch.relu(output)
-    target_1h = targets['target_1h']
-    predicted_sum = torch.sum(output, dim=1, keepdim=True)
-    target_sum = targets['target_sum']
+    eps = EPS
+
+    # 重要: ここからfloat32で安定計算
+    logits = output.float()                # (B,3,H,W)
+    S = targets['target_sum'].float()      # (B,1,H,W)
+    target_1h = targets['target_1h'].float()  # (B,3,H,W)
+
+    # softmax -> 比率（微小値を下限clampしてから再正規化）
+    ratios = torch.softmax(logits, dim=1)                          # (B,3,H,W)
+    ratios = torch.clamp(ratios, min=eps)                          # avoid log(0)
+    ratios = ratios / ratios.sum(dim=1, keepdim=True).clamp_min(eps)
+
+    # 比率×既知Sで1時間値を復元
+    pred_1h = ratios * S                                            # (B,3,H,W)
+    pred_sum = pred_1h.sum(dim=1, keepdim=True)                     # (B,1,H,W)
 
     # 非加重MSE（RMSE計算用）
-    unweighted_mse_1h = nn.functional.mse_loss(output, target_1h)
-    unweighted_mse_sum = nn.functional.mse_loss(predicted_sum, target_sum)
+    unweighted_mse_1h = nn.functional.mse_loss(pred_1h, target_1h)
+    unweighted_mse_sum = nn.functional.mse_loss(pred_sum, S)
 
+    # 強度重み付きMSE（v5設定を流用）
     if ENABLE_INTENSITY_WEIGHTED_LOSS:
-        # 1時間（3ch）は強度重み付きMSE
-        loss_1h_mse = _weighted_mse(output, target_1h, INTENSITY_WEIGHT_BINS_1H, INTENSITY_WEIGHT_VALUES_1H)
-        # sumは非加重（全て1.0の重み）にして水収支整合を重視
-        loss_sum_mse = _weighted_mse(predicted_sum, target_sum, INTENSITY_WEIGHT_BINS_SUM, INTENSITY_WEIGHT_VALUES_SUM)
+        loss_1h_mse = _weighted_mse(pred_1h, target_1h, INTENSITY_WEIGHT_BINS_1H, INTENSITY_WEIGHT_VALUES_1H)
+        loss_sum_mse = _weighted_mse(pred_sum, S, INTENSITY_WEIGHT_BINS_SUM, INTENSITY_WEIGHT_VALUES_SUM)
     else:
         loss_1h_mse = unweighted_mse_1h
         loss_sum_mse = unweighted_mse_sum
 
+    # 数値安定化（NaN/Inf防御）
+    loss_1h_mse = torch.nan_to_num(loss_1h_mse, nan=0.0, posinf=1e6, neginf=0.0)
+    loss_sum_mse = torch.nan_to_num(loss_sum_mse, nan=0.0, posinf=1e6, neginf=0.0)
+
     total_loss = loss_1h_mse + loss_sum_mse
 
+    # 比率のKL（S>0の画素のみ）。y_ratioはチャネル方向で正規化して安定化
+    if RATIO_LOSS_WEIGHT > 0:
+        with torch.no_grad():
+            mask = (S > 0.0).float()                                # (B,1,H,W)
+        # まず粗い比率を作ってからチャネル方向で正規化
+        y_ratio = target_1h / (S + eps)                             # (B,3,H,W)
+        y_ratio = torch.clamp(y_ratio, min=0.0)                     # 負の漏れ対策
+        y_den = y_ratio.sum(dim=1, keepdim=True).clamp_min(eps)     # (B,1,H,W)
+        y_ratio = y_ratio / y_den                                   # チャネル合計=1に正規化
+        # KL(y||w) = Σ y * log(y/w)
+        kl_map = (y_ratio * (torch.log(y_ratio + eps) - torch.log(ratios + eps))).sum(dim=1, keepdim=True)
+        # マスク平均
+        loss_ratio = (kl_map * mask).sum() / (mask.sum() + eps)
+        # NaN/Inf防御
+        loss_ratio = torch.nan_to_num(loss_ratio, nan=0.0, posinf=0.0, neginf=0.0)
+        total_loss = total_loss + RATIO_LOSS_WEIGHT * loss_ratio
+        # 総損失の数値安定化
+        total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=1e6, neginf=0.0)
+
+    # ログ用RMSE
     with torch.no_grad():
         rmse_1h = torch.sqrt(unweighted_mse_1h)
         rmse_sum = torch.sqrt(unweighted_mse_sum)
@@ -403,6 +453,9 @@ def train_one_epoch(rank, model, dataloader, optimizer, scaler, epoch, exec_log_
                 outputs = model(inputs)
                 loss, loss_1h, loss_sum = custom_loss_function(outputs, targets)
             scaler.scale(loss).backward()
+            # 勾配クリッピング（数値安定化）
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             total_loss += loss.item()
@@ -483,13 +536,19 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
             total_1h_rmse += loss_1h.item()
             total_sum_rmse += loss_sum.item()
 
-            # 追加: 詳細メトリクスのためのデータ
-            outputs = torch.relu(outputs)
-            pred_1h = outputs.detach().cpu().numpy()       # (B,3,H,W)
-            true_1h = targets['target_1h'].detach().cpu().numpy()
-            pred_sum = outputs.sum(dim=1, keepdim=True).detach().cpu().numpy()  # (B,1,H,W)
-            true_sum = targets['target_sum'].detach().cpu().numpy()
-            B, _, H, W = outputs.shape
+            # 追加: 詳細メトリクスのためのデータ（softmax比率×既知S）
+            logits = outputs
+            ratios = torch.softmax(logits, dim=1)
+            S = targets['target_sum']
+            pred_1h_t = ratios * S
+            pred_sum_t = pred_1h_t.sum(dim=1, keepdim=True)
+            true_1h_t = targets['target_1h']
+            # detach to numpy
+            pred_1h = pred_1h_t.detach().cpu().numpy()       # (B,3,H,W)
+            pred_sum = pred_sum_t.detach().cpu().numpy()      # (B,1,H,W)
+            true_1h = true_1h_t.detach().cpu().numpy()
+            true_sum = S.detach().cpu().numpy()
+            B, _, H, W = logits.shape
 
             # バイナリ（時刻別・積算）
             for i, thr in enumerate(BINARY_THRESHOLDS_MM_1H):
@@ -670,7 +729,7 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
 
     if rank == 0:
         os.makedirs(result_img_dir, exist_ok=True)
-        main_logger.info(f"[v5] 検証データ全体に対する可視化を開始 (モデル: {os.path.basename(best_model_path)})")
+        main_logger.info(f"[ratio] 検証データ全体に対する可視化を開始 (モデル: {os.path.basename(best_model_path)})")
     
     # rank 0のみで全インデックスを処理
     proc_indices = list(range(len(valid_dataset)))
@@ -693,9 +752,11 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             target_sum = target_1h.sum(dim=0, keepdim=False)  # (H, W)
 
             with autocast(device_type='cuda', dtype=torch.float16):
-                output = model(inputs)
-            output = torch.relu(output).squeeze(0).cpu()  # (3, H, W)
-            pred_sum = output.sum(dim=0)  # (H, W)
+                logits = model(inputs)  # (1,3,H,W)
+            ratios = torch.softmax(logits, dim=1)
+            S = sample['target_sum'].unsqueeze(0).to(device)  # (1,1,H,W)
+            pred_1h = (ratios * S).squeeze(0).detach().cpu()  # (3, H, W)
+            pred_sum = pred_1h.sum(dim=0)  # (H, W)
 
             # 対数色スケール設定 (LogNorm)
             cmap = plt.get_cmap("Blues")
@@ -706,7 +767,7 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             stack_vals = torch.stack([
                 pred_sum,
                 target_sum,
-                output[0], output[1], output[2],
+                pred_1h[0], pred_1h[1], pred_1h[2],
                 target_1h[0], target_1h[1], target_1h[2]
             ], dim=0).numpy()
             flat = stack_vals.reshape(8, -1)
@@ -723,7 +784,7 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             fig.suptitle(f"Validation Time: {np.datetime_as_string(time_val, unit='m')}", fontsize=16)
 
             plot_data = [
-                pred_sum.numpy(), output[0].numpy(), output[1].numpy(), output[2].numpy(),
+                pred_sum.numpy(), pred_1h[0].numpy(), pred_1h[1].numpy(), pred_1h[2].numpy(),
                 target_sum.numpy(), target_1h[0].numpy(), target_1h[1].numpy(), target_1h[2].numpy()
             ]
             titles = [
@@ -911,8 +972,8 @@ def plot_epoch_metrics(metric_history, out_dir, logger):
 
 @torch.no_grad()
 def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger):
-    """最終モデルの評価（v5仕様: 拡張メトリクスを一括計算）"""
-    main_logger.info("Starting final model evaluation (v5)...")
+    """最終モデルの評価（ratio仕様: 拡張メトリクスを一括計算）"""
+    main_logger.info("Starting final model evaluation (ratio)...")
     
     model = SwinTransformerSys(
         img_size=IMG_SIZE, patch_size=PATCH_SIZE, in_chans=IN_CHANS, num_classes=NUM_CLASSES,
@@ -941,21 +1002,24 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
 
     conf_wethours = np.zeros((4, 4), dtype=np.int64)
 
-    progress_bar = tqdm(eval_loader, desc="Evaluating Model (v5)", leave=False)
+    progress_bar = tqdm(eval_loader, desc="Evaluating Model (ratio)", leave=False)
     for batch in progress_bar:
         inputs = batch['input'].to(device)
         targ_1h = batch['target_1h'].to(device)
         targ_sum = batch['target_sum'].to(device)
 
         with autocast(device_type='cuda', dtype=torch.float16):
-            outputs = model(inputs)
-        outputs = torch.relu(outputs)
+            logits = model(inputs)
+        ratios = torch.softmax(logits, dim=1)
+        S = targ_sum
+        pred_1h_t = ratios * S
+        pred_sum_t = pred_1h_t.sum(dim=1, keepdim=True)
 
-        pred_1h = outputs.detach().cpu().numpy()
+        pred_1h = pred_1h_t.detach().cpu().numpy()
         true_1h = targ_1h.detach().cpu().numpy()
-        pred_sum = outputs.sum(dim=1, keepdim=True).detach().cpu().numpy()
+        pred_sum = pred_sum_t.detach().cpu().numpy()
         true_sum = targ_sum.detach().cpu().numpy()
-        B, _, H, W = outputs.shape
+        B, _, H, W = logits.shape
 
         for thr in BINARY_THRESHOLDS_MM_1H:
             tp, tn, fp, fn = _tally_binary(pred_1h, true_1h, thr)
@@ -1050,7 +1114,7 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
 
     with open(eval_log_path, 'a', encoding='utf-8') as f:
         f.write("="*70 + "\n")
-        f.write("Final Model Evaluation (v5) with extended metrics\n")
+        f.write("Final Model Evaluation (ratio) with extended metrics\n")
         f.write("="*70 + "\n\n")
 
         f.write("[Binary Metrics - Hourly (per-pixel over all 3 hours)]\n")
@@ -1098,36 +1162,8 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
         f.write("[Wet-hour count pattern (0/1/2/3) - Consistency]\n")
         f.write(f"Overall pattern accuracy: {acc_wethour_pattern:.4f}\n")
 
-    main_logger.info(f"Evaluation (v5) finished. Results saved to '{eval_log_path}'")
+    main_logger.info(f"Evaluation (ratio) finished. Results saved to '{eval_log_path}'")
 
-def create_video_from_images(image_dir, output_path, fps, logger):
-    """
-    画像群を連結して動画作成（MP4, libx264）
-    imageioが未インストールならスキップ
-    """
-    if not IMAGEIO_AVAILABLE:
-        logger.warning("imageioが見つからないため、動画作成をスキップします。pip install imageio imageio-ffmpeg を検討してください。")
-        return
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    # 検証画像は validation_*.png で保存される
-    pattern = os.path.join(image_dir, 'validation_*.png')
-    files = sorted(glob.glob(pattern))
-
-    if len(files) == 0:
-        logger.warning(f"動画化対象画像が見つかりませんでした: {pattern}")
-        return
-
-    logger.info(f"動画作成を開始: フレーム数={len(files)}, fps={fps}, 出力='{output_path}'")
-    try:
-        writer = imageio.get_writer(output_path, fps=fps, codec='libx264', quality=8, pixelformat='yuv420p')
-        for i, fpath in enumerate(files):
-            frame = imageio.imread(fpath)
-            writer.append_data(frame)
-        writer.close()
-        logger.info(f"動画作成が完了しました: '{output_path}'")
-    except Exception as e:
-        logger.error(f"動画作成に失敗しました: {e}")
 
 # ==============================================================================
 # 7. メインワーカ関数
@@ -1143,13 +1179,13 @@ def main_worker(rank, world_size, train_files, valid_files):
         main_log.info(f"DDP on {world_size} GPUs. Total batch size: {BATCH_SIZE * world_size}")
         main_log.info(f"Input channels: {IN_CHANS}")
         main_log.info(f"RANDOM_SEED set to: {RANDOM_SEED} for reproducibility.")
-        # v5: 重み付き損失の設定を表示
+        # ratio: 重み付き損失の設定を表示
         if ENABLE_INTENSITY_WEIGHTED_LOSS:
-            main_log.info(f"[v5] Intensity-weighted loss ENABLED.")
-            main_log.info(f"[v5] 1h bins={INTENSITY_WEIGHT_BINS_1H}, weights={INTENSITY_WEIGHT_VALUES_1H}")
-            main_log.info(f"[v5] Sum bins={INTENSITY_WEIGHT_BINS_SUM}, weights={INTENSITY_WEIGHT_VALUES_SUM}")
+            main_log.info(f"[ratio] Intensity-weighted loss ENABLED.")
+            main_log.info(f"[ratio] 1h bins={INTENSITY_WEIGHT_BINS_1H}, weights={INTENSITY_WEIGHT_VALUES_1H}")
+            main_log.info(f"[ratio] Sum bins={INTENSITY_WEIGHT_BINS_SUM}, weights={INTENSITY_WEIGHT_VALUES_SUM}")
         else:
-            main_log.info(f"[v5] Intensity-weighted loss DISABLED (using plain MSE).")
+            main_log.info(f"[ratio] Intensity-weighted loss DISABLED (using plain MSE).")
     
     train_dataset = NetCDFDataset(train_files, logger=(main_log if rank == 0 else None))
     valid_dataset = NetCDFDataset(valid_files, logger=(main_log if rank == 0 else None))
@@ -1249,13 +1285,8 @@ def main_worker(rank, world_size, train_files, valid_files):
         plot_epoch_metrics(metric_history, EPOCH_METRIC_PLOT_DIR, main_log)
         # v5: 拡張評価（最終モデル）
         evaluate_model(MODEL_SAVE_PATH, valid_dataset, torch.device(f"cuda:{rank}"), EVALUATION_LOG_PATH, main_log)
-        # v5: 画像→動画化
-        create_video_from_images(RESULT_IMG_DIR, VIDEO_OUTPUT_PATH, VIDEO_FPS, main_log)
-
         main_log.info(f"Result images saved in '{RESULT_IMG_DIR}/'.")
         main_log.info(f"Epoch metrics plots saved in '{EPOCH_METRIC_PLOT_DIR}/'.")
-        if IMAGEIO_AVAILABLE:
-            main_log.info(f"Validation video saved to '{VIDEO_OUTPUT_PATH}'.")
         main_log.info("All processes finished successfully.")
     
     cleanup_ddp()
