@@ -3,26 +3,7 @@ import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 from timm.layers import DropPath, to_2tuple, trunc_normal_
 from einops import rearrange
-import math
 
-
-
-class MoEFFNGating(nn.Module):
-    def __init__(self, dim, hidden_dim, num_experts):
-        super(MoEFFNGating, self).__init__()
-        self.gating_network = nn.Linear(dim, dim)
-        self.experts = nn.ModuleList([nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, dim)) for _ in range(num_experts)])
-
-    def forward(self, x):
-        weights = self.gating_network(x)
-        weights = torch.nn.functional.softmax(weights, dim=-1)
-        outputs = [expert(x) for expert in self.experts]
-        outputs = torch.stack(outputs, dim=0)
-        outputs = (weights.unsqueeze(0) * outputs).sum(dim=0)
-        return outputs
 
 
 class Mlp(nn.Module):
@@ -288,30 +269,6 @@ class PatchExpand(nn.Module):
         return x
 
 
-class FinalPatchExpand_X4(nn.Module):
-    def __init__(self, input_resolution, dim, dim_scale=4, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.input_resolution = input_resolution
-        self.dim = dim
-        self.dim_scale = dim_scale
-        self.expand = nn.Linear(dim, 16 * dim, bias=False)
-        self.output_dim = dim
-        self.norm = norm_layer(self.output_dim)
-
-    def forward(self, x):
-        H, W = self.input_resolution
-        x = self.expand(x)
-        B, L, C = x.shape
-        assert L == H * W
-
-        x = x.view(B, H, W, C)
-        x = rearrange(x, 'b h w (p1 p2 c)-> b (h p1) (w p2) c',                    p1=self.dim_scale, p2=self.dim_scale, c=C // (self.dim_scale ** 2))
-        x = x.view(B, -1, self.output_dim)
-        x = self.norm(x)
-
-        return x
-
-
 class FinalPatchExpand(nn.Module):
     def __init__(self, input_resolution, dim, dim_scale, norm_layer=nn.LayerNorm):
         super().__init__()
@@ -462,7 +419,8 @@ class SwinTransformerSys(nn.Module):
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
-                 use_checkpoint=False, final_upsample="expand_first", **kwargs):
+                 use_checkpoint=False, final_upsample="expand_first",
+                 temperature_mode='none', tau_init=1.0, tau_min=0.05, **kwargs):
         super().__init__()
         self.num_classes = num_classes
         self.num_layers = len(depths)
@@ -473,6 +431,24 @@ class SwinTransformerSys(nn.Module):
         self.num_features_up = int(embed_dim * 2)
         self.mlp_ratio = mlp_ratio
         self.final_upsample = final_upsample
+
+        # Temperature scaling configuration
+        self.temperature_mode = temperature_mode
+        self.tau_min = tau_min
+        if self.temperature_mode == 'global':
+            self.log_tau = nn.Parameter(torch.log(torch.tensor(tau_init, dtype=torch.float32)))
+            self.temp_head = None
+        elif self.temperature_mode == 'dynamic':
+            # Predict spatially-varying temperature from final upsampled features
+            self.log_tau = None
+            self.temp_head = nn.Sequential(
+                nn.Conv2d(embed_dim, max(8, embed_dim // 2), kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(max(8, embed_dim // 2), 1, kernel_size=1)
+            )
+        else:
+            self.log_tau = None
+            self.temp_head = None
 
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
@@ -599,12 +575,27 @@ class SwinTransformerSys(nn.Module):
         B, L, C = x.shape
         assert L == H * W
 
+        tau_map = None
         if self.final_upsample == "expand_first":
             x = self.up(x)
             x = x.view(B, self.up.dim_scale * H, self.up.dim_scale * W, -1)
-            x = x.permute(0, 3, 1, 2)
-            x = self.output(x)
-        return x
+            x_feat = x.permute(0, 3, 1, 2)  # (B, embed_dim, H, W)
+
+            # Temperature head
+            if self.temperature_mode == 'dynamic' and self.temp_head is not None:
+                tau_logit = self.temp_head(x_feat)
+                tau_map = torch.nn.functional.softplus(tau_logit) + self.tau_min  # (B,1,H,W) > 0
+            elif self.temperature_mode == 'global' and self.log_tau is not None:
+                tau = torch.nn.functional.softplus(self.log_tau) + self.tau_min       # scalar > 0
+                tau_map = tau.view(1, 1, 1, 1).expand(B, 1, x_feat.shape[2], x_feat.shape[3])
+
+            logits = self.output(x_feat)
+
+        # Return with or without temperature
+        if self.temperature_mode == 'none':
+            return logits
+        else:
+            return logits, tau_map
 
     def forward(self, x):
         x, x_downsample = self.forward_features(x)
@@ -619,4 +610,4 @@ class SwinTransformerSys(nn.Module):
             flops += layer.flops()
         flops += self.num_features * self.patches_resolution[0] * self.patches_resolution[1] // (2 ** self.num_layers)
         flops += self.num_features * self.num_classes
-        return flops 
+        return flops

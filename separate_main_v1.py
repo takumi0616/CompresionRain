@@ -14,7 +14,6 @@ import glob
 import warnings
 import matplotlib.pyplot as plt
 import hdf5plugin  # noqa: F401  # register external HDF5 filters for h5netcdf
-import matplotlib.cm as cm
 from matplotlib.colors import LogNorm
 import numpy as np
 import torch
@@ -80,6 +79,12 @@ IMG_SIZE = 480
 PATCH_SIZE = 4
 NUM_CLASSES = 3
 
+# 温度付きSoftmaxの設定
+# 'none'（従来どおり）, 'global'（学習可能なスカラー温度）, 'dynamic'（空間的に変化する温度を推定）
+TEMPERATURE_MODE = 'dynamic'
+TAU_INIT = 1.0
+TAU_MIN = 0.05
+
 # --- 変数定義 ---
 INPUT_VARS_COMMON = [
     'Prmsl', 'U10m', 'V10m', 'T2m', 'U975', 'V975', 'T975',
@@ -112,13 +117,13 @@ ENABLE_INTENSITY_WEIGHTED_LOSS = True  # Trueで有効化
 # 1時間降水の重み（ビン境界と各ビンの重み）
 # 境界は [1, 5, 10, 20, 30, 50]（右開区間）。重みは len(boundaries)+1 個。
 INTENSITY_WEIGHT_BINS_1H = [1.0, 5.0, 10.0, 20.0, 30.0, 50.0]  # mm/h
-INTENSITY_WEIGHT_VALUES_1H = [1.0, 1.5, 2.0, 4.0, 6.0, 8.0, 10.0]
+INTENSITY_WEIGHT_VALUES_1H = [1.0, 1.1, 1.3, 2.2, 9.7, 25.7, 100.0]
 
 # 3時間積算（sum）は1hの2倍スケールのビン境界＋段階的な整数重み（頻度不均衡の緩和）
 # 例: 1hの50mmに対してsumは100mmまで（2倍スケール）
 INTENSITY_WEIGHT_BINS_SUM = [2.0, 10.0, 20.0, 40.0, 60.0, 100.0]  # mm/3h
 # 不均衡を考慮した穏やかな昇順の整数重み（過度に大きな係数は避けつつ、強雨ほど重視）
-INTENSITY_WEIGHT_VALUES_SUM = [1.0, 1.5, 2.0, 4.0, 6.0, 8.0, 10.0]
+INTENSITY_WEIGHT_VALUES_SUM = [1.0, 1.1, 1.3, 2.2, 9.7, 25.7, 100.0]
 # 比率モデル用の追加ハイパラ
 RATIO_LOSS_WEIGHT = 0.2  # 比率KLの重み（0で無効）
 EPS = 1e-6
@@ -377,12 +382,19 @@ def custom_loss_function(output, targets):
     eps = EPS
 
     # 重要: ここからfloat32で安定計算
-    logits = output.float()                # (B,3,H,W)
+    if isinstance(output, (tuple, list)) and len(output) == 2:
+        logits, tau_map = output
+        logits = logits.float()
+        tau_map = tau_map.float().clamp_min(eps)
+    else:
+        logits = output.float()
+        tau_map = None
     S = targets['target_sum'].float()      # (B,1,H,W)
     target_1h = targets['target_1h'].float()  # (B,3,H,W)
 
     # softmax -> 比率（微小値を下限clampしてから再正規化）
-    ratios = torch.softmax(logits, dim=1)                          # (B,3,H,W)
+    logits_scaled = logits / tau_map if tau_map is not None else logits
+    ratios = torch.softmax(logits_scaled, dim=1)                   # (B,3,H,W)
     ratios = torch.clamp(ratios, min=eps)                          # avoid log(0)
     ratios = ratios / ratios.sum(dim=1, keepdim=True).clamp_min(eps)
 
@@ -536,9 +548,16 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
             total_1h_rmse += loss_1h.item()
             total_sum_rmse += loss_sum.item()
 
-            # 追加: 詳細メトリクスのためのデータ（softmax比率×既知S）
-            logits = outputs
-            ratios = torch.softmax(logits, dim=1)
+            # 追加: 詳細メトリクスのためのデータ（温度付きsoftmax比率×既知S）
+            if isinstance(outputs, (tuple, list)) and len(outputs) == 2:
+                logits, tau_map = outputs
+                logits_scaled = logits / tau_map.clamp_min(EPS)
+            else:
+                logits = outputs
+                logits_scaled = logits
+            ratios = torch.softmax(logits_scaled, dim=1)
+            ratios = torch.clamp(ratios, min=EPS)
+            ratios = ratios / ratios.sum(dim=1, keepdim=True).clamp_min(EPS)
             S = targets['target_sum']
             pred_1h_t = ratios * S
             pred_sum_t = pred_1h_t.sum(dim=1, keepdim=True)
@@ -722,7 +741,8 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
     model = SwinTransformerSys(
         img_size=IMG_SIZE, patch_size=PATCH_SIZE, in_chans=IN_CHANS, num_classes=NUM_CLASSES,
         embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=15,
-        mlp_ratio=4., qkv_bias=True, norm_layer=nn.LayerNorm, use_checkpoint=False
+        mlp_ratio=4., qkv_bias=True, norm_layer=nn.LayerNorm, use_checkpoint=False,
+        temperature_mode=TEMPERATURE_MODE, tau_init=TAU_INIT, tau_min=TAU_MIN
     ).to(device)
     model.load_state_dict(torch.load(best_model_path, map_location=device))
     model.eval()
@@ -752,8 +772,16 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             target_sum = target_1h.sum(dim=0, keepdim=False)  # (H, W)
 
             with autocast(device_type='cuda', dtype=torch.float16):
-                logits = model(inputs)  # (1,3,H,W)
-            ratios = torch.softmax(logits, dim=1)
+                outputs = model(inputs)
+            if isinstance(outputs, (tuple, list)) and len(outputs) == 2:
+                logits, tau_map = outputs
+                logits_scaled = logits / tau_map.clamp_min(EPS)
+            else:
+                logits = outputs
+                logits_scaled = logits
+            ratios = torch.softmax(logits_scaled, dim=1)
+            ratios = torch.clamp(ratios, min=EPS)
+            ratios = ratios / ratios.sum(dim=1, keepdim=True).clamp_min(EPS)
             S = sample['target_sum'].unsqueeze(0).to(device)  # (1,1,H,W)
             pred_1h = (ratios * S).squeeze(0).detach().cpu()  # (3, H, W)
             pred_sum = pred_1h.sum(dim=0)  # (H, W)
@@ -978,7 +1006,8 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
     model = SwinTransformerSys(
         img_size=IMG_SIZE, patch_size=PATCH_SIZE, in_chans=IN_CHANS, num_classes=NUM_CLASSES,
         embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=15,
-        mlp_ratio=4., qkv_bias=True, norm_layer=nn.LayerNorm, use_checkpoint=False
+        mlp_ratio=4., qkv_bias=True, norm_layer=nn.LayerNorm, use_checkpoint=False,
+        temperature_mode=TEMPERATURE_MODE, tau_init=TAU_INIT, tau_min=TAU_MIN
     ).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
@@ -1009,8 +1038,16 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
         targ_sum = batch['target_sum'].to(device)
 
         with autocast(device_type='cuda', dtype=torch.float16):
-            logits = model(inputs)
-        ratios = torch.softmax(logits, dim=1)
+            outputs = model(inputs)
+        if isinstance(outputs, (tuple, list)) and len(outputs) == 2:
+            logits, tau_map = outputs
+            logits_scaled = logits / tau_map.clamp_min(EPS)
+        else:
+            logits = outputs
+            logits_scaled = logits
+        ratios = torch.softmax(logits_scaled, dim=1)
+        ratios = torch.clamp(ratios, min=EPS)
+        ratios = ratios / ratios.sum(dim=1, keepdim=True).clamp_min(EPS)
         S = targ_sum
         pred_1h_t = ratios * S
         pred_sum_t = pred_1h_t.sum(dim=1, keepdim=True)
@@ -1200,7 +1237,8 @@ def main_worker(rank, world_size, train_files, valid_files):
         img_size=IMG_SIZE, patch_size=PATCH_SIZE, in_chans=IN_CHANS, num_classes=NUM_CLASSES,
         embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=15,
         mlp_ratio=4., qkv_bias=True, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
-        norm_layer=nn.LayerNorm, ape=False, patch_norm=True, use_checkpoint=False
+        norm_layer=nn.LayerNorm, ape=False, patch_norm=True, use_checkpoint=False,
+        temperature_mode=TEMPERATURE_MODE, tau_init=TAU_INIT, tau_min=TAU_MIN
     ).to(rank)
     model = DDP(model, device_ids=[rank], find_unused_parameters=False)
     
