@@ -18,9 +18,11 @@ notify-run gpu01 -- nohup python swinunet_main_v3.py > swinunet_main_v3.log 2>&1
 notify-run gpu01 -- nohup python swinunet_main_v4.py > swinunet_main_v4.log 2>&1 &
 
 notify-run gpu01 -- nohup python separate_main_v1.py > separate_main_v1.log 2>&1 &
-```
 
-src/CompresionRain/separate_main_v1.py
+notify-run gpu01 -- nohup python separate_main_v2.py > separate_main_v2.log 2>&1 &
+
+nohup python data_check_separate.py > data_check_separate.log 2>&1 &
+```
 
 タスクの削除
 
@@ -40,6 +42,8 @@ pkill -f "swinunet_main_v3.py"
 pkill -f "swinunet_main_v4.py"
 
 pkill -f "separate_main_v1.py"
+
+pkill -f "data_check_separate.py"
 ```
 
 ```bash
@@ -58,5 +62,5 @@ sudo kill -9 1493785
 ## gpu01 → mac
 
 ```bash
-rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/CompresionRain/swin-unet_ratio_result /Users/takumi0616/Develop/docker_miniconda/src/CompresionRain/result_gpu01
+rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/CompresionRain/swin-unet_ratio_result_v2 /Users/takumi0616/Develop/docker_miniconda/src/CompresionRain/result_gpu01
 ```
