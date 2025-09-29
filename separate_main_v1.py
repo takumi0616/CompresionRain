@@ -46,7 +46,7 @@ os.environ['HDF5_DISABLE_VERSION_CHECK'] = '1'
 # ==============================================================================
 
 # --- データパス設定 ---
-DATA_DIR = './optimization_nc'
+DATA_DIR = './output_nc'
 TRAIN_YEARS = [2018, 2019, 2020, 2021]
 VALID_YEARS = [2022]
 
