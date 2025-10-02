@@ -13,9 +13,9 @@ notify-run gpu01 -- nohup python3 check_output_nc.py > check_output_nc.log 2>&1 
 
 notify-run gpu01 -- nohup python swinunet_main_v2.py > swinunet_main_v2.log 2>&1 &
 
-notify-run gpu01 -- nohup python swinunet_main_v3.py > swinunet_main_v3.log 2>&1 &
+notify-run gpu02 -- nohup python swinunet_main_v5.py > swinunet_main_v5.log 2>&1 &
 
-notify-run gpu01 -- nohup python swinunet_main_v4.py > swinunet_main_v4.log 2>&1 &
+notify-run gpu02 -- nohup python analyze_1h_bin_distribution.py > analyze_1h_bin_distribution.log 2>&1 &
 
 notify-run gpu01 -- nohup python separate_main_v1.py > separate_main_v1.log 2>&1 &
 
@@ -26,6 +26,8 @@ nohup python data_check_separate.py > data_check_separate.log 2>&1 &
 nohup python check_output_nc.py > check_output_nc.log 2>&1 &
 
 ```
+
+/home/devel/work_takasuka_git/docker_miniconda/src/CompresionRain/analyze_1h_bin_distribution.py
 
 /home/devel/work_takasuka_git/docker_miniconda/src/CompresionRain/
 タスクの削除
@@ -43,7 +45,7 @@ pkill -f "convert_nc.py"
 
 pkill -f "swinunet_main_v3.py"
 
-pkill -f "swinunet_main_v4.py"
+pkill -f "swinunet_main_v5.py"
 
 pkill -f "separate_main_v1.py"
 

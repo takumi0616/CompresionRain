@@ -42,6 +42,32 @@ EXPECTED_END   = "202312"
 YM_PAT = re.compile(r"^(\d{6})\.nc$")
 DEFAULT_TIME_CHUNK = 24  # 1日分を目安（--time-chunk で変更可能）
 
+# =========================
+# 追加: 降水ビン集計の設定
+# =========================
+# 1時間降水（重み用ビンと同一スケール）
+BIN_EDGES_1H = np.array([1.0, 5.0, 10.0, 20.0, 30.0, 50.0], dtype=np.float64)  # 右開区間 (right=False)
+BIN_LABELS_1H = [
+    "<1",
+    "1-5",
+    "5-10",
+    "10-20",
+    "20-30",
+    "30-50",
+    "50+",
+]
+# 3時間積算（1hの2倍スケール）
+SUM_BIN_EDGES = np.array([2.0, 10.0, 20.0, 40.0, 60.0, 100.0], dtype=np.float64)
+SUM_BIN_LABELS = [
+    "<2",
+    "2-10",
+    "10-20",
+    "20-40",
+    "40-60",
+    "60-100",
+    "100+",
+]
+
 # ---------------------------------------------------------
 # ロギングヘルパー
 # ---------------------------------------------------------
@@ -339,6 +365,495 @@ def check_precip_sum(h5f, time_chunk: int, tol: float,
     mean_abs = (sum_abs / total) if total > 0 else None
     return {"present": True, "total": total, "violations": violations, "mean_abs_diff": mean_abs, "max_abs_diff": max_abs, "tol": tol}
 
+# =========================
+# 追加: ビン集計・相関分析ユーティリティ
+# =========================
+def count_bins_for_array(arr: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
+    """
+    有効値のみ対象としてビンカウントを返す。
+    戻り: shape = (len(bin_edges)+1,) int64
+    """
+    v = np.asarray(arr).ravel()
+    mask = np.isfinite(v)
+    if not np.any(mask):
+        return np.zeros(len(bin_edges) + 1, dtype=np.int64)
+    idx = np.digitize(v[mask], bin_edges, right=False)  # 0..len(bin_edges)
+    return np.bincount(idx, minlength=len(bin_edges) + 1).astype(np.int64)
+
+def analyze_bin_distributions(nc_files: List[Path], time_chunk: int) -> Dict[str, Any]:
+    """
+    analyze_1h_bin_distribution.py 相当の処理をh5pyベースで統合実装。
+    - 対象: Prec_Target_ft4/5/6（1h, mm/h）, Prec_4_6h_sum（3時間積算, mm/3h）
+    - 出力: 全体/各変数のビン別カウントと割合
+    """
+    target_1h_vars = ["Prec_Target_ft4", "Prec_Target_ft5", "Prec_Target_ft6"]
+    total_counts_1h = np.zeros(len(BIN_EDGES_1H) + 1, dtype=np.int64)
+    per_var_counts_1h = {v: np.zeros(len(BIN_EDGES_1H) + 1, dtype=np.int64) for v in target_1h_vars}
+    sum_counts = np.zeros(len(SUM_BIN_EDGES) + 1, dtype=np.int64)
+
+    for fp in nc_files:
+        try:
+            with h5py.File(fp, "r") as f:
+                # 1hターゲット
+                present_1h = [v for v in target_1h_vars if v in f]
+                if present_1h:
+                    # 時間軸を合わせるため先頭のtime軸を基準に回す
+                    ds0 = f[present_1h[0]]
+                    tax0 = guess_time_axis(ds0, f)
+                    if tax0 is None:
+                        for v in present_1h:
+                            arr = apply_cf_scaling(f[v][...], f[v])
+                            c = count_bins_for_array(arr, BIN_EDGES_1H)
+                            per_var_counts_1h[v] += c
+                            total_counts_1h += c
+                    else:
+                        T = ds0.shape[tax0]
+                        for t0 in range(0, T, time_chunk):
+                            t1 = min(T, t0 + time_chunk)
+                            for v in present_1h:
+                                c = count_bins_for_array(read_block(f[v], tax0, t0, t1), BIN_EDGES_1H)
+                                per_var_counts_1h[v] += c
+                                total_counts_1h += c
+                # 3時間積算
+                if "Prec_4_6h_sum" in f:
+                    ds = f["Prec_4_6h_sum"]; tax = guess_time_axis(ds, f)
+                    if tax is None:
+                        arr = apply_cf_scaling(ds[...], ds)
+                        sum_counts += count_bins_for_array(arr, SUM_BIN_EDGES)
+                    else:
+                        T = ds.shape[tax]
+                        for t0 in range(0, T, time_chunk):
+                            t1 = min(T, t0 + time_chunk)
+                            arr = read_block(ds, tax, t0, t1)
+                            sum_counts += count_bins_for_array(arr, SUM_BIN_EDGES)
+                else:
+                    # 代替: 3時刻の和
+                    if all(v in f for v in target_1h_vars):
+                        ds = f[target_1h_vars[0]]; tax = guess_time_axis(ds, f)
+                        if tax is None:
+                            arr = (apply_cf_scaling(f[target_1h_vars[0]][...], f[target_1h_vars[0]]) +
+                                   apply_cf_scaling(f[target_1h_vars[1]][...], f[target_1h_vars[1]]) +
+                                   apply_cf_scaling(f[target_1h_vars[2]][...], f[target_1h_vars[2]]))
+                            sum_counts += count_bins_for_array(arr, SUM_BIN_EDGES)
+                        else:
+                            T = ds.shape[tax]
+                            for t0 in range(0, T, time_chunk):
+                                t1 = min(T, t0 + time_chunk)
+                                arr = (read_block(f[target_1h_vars[0]], tax, t0, t1) +
+                                       read_block(f[target_1h_vars[1]], tax, t0, t1) +
+                                       read_block(f[target_1h_vars[2]], tax, t0, t1))
+                                sum_counts += count_bins_for_array(arr, SUM_BIN_EDGES)
+        except Exception as e:
+            logging.warning(f"[BIN] {Path(fp).name}: 集計中にエラー: {e}")
+
+    def make_ratio(counts: np.ndarray) -> List[float]:
+        tot = int(counts.sum())
+        return [(float(c) / tot * 100.0) if tot > 0 else 0.0 for c in counts.tolist()]
+
+    report = {
+        "bin_edges_1h": BIN_EDGES_1H.tolist(),
+        "bin_labels_1h": list(BIN_LABELS_1H),
+        "overall_1h": {
+            "total": int(total_counts_1h.sum()),
+            "counts": total_counts_1h.tolist(),
+            "ratios": make_ratio(total_counts_1h),
+        },
+        "per_var_1h": {
+            v: {
+                "total": int(per_var_counts_1h[v].sum()),
+                "counts": per_var_counts_1h[v].tolist(),
+                "ratios": make_ratio(per_var_counts_1h[v]),
+            }
+            for v in per_var_counts_1h.keys()
+        },
+        "bin_edges_sum": SUM_BIN_EDGES.tolist(),
+        "bin_labels_sum": list(SUM_BIN_LABELS),
+        "overall_sum": {
+            "total": int(sum_counts.sum()),
+            "counts": sum_counts.tolist(),
+            "ratios": make_ratio(sum_counts),
+        },
+    }
+    return report
+
+def analyze_relations(nc_files: List[Path], time_chunk: int) -> Dict[str, Any]:
+    """
+    降水と予測変数（時間特徴/直前降水）の関係を時系列（空間平均）で解析。
+    - 対象ターゲット: Prec_Target_ft4/5/6 と 3h積算（合成）
+    - 特徴量: Prec_ft3, hour_cos, hour_sin, dayofyear_cos, dayofyear_sin（存在時のみ）
+    - 指標: Pearson相関係数（時系列：各時刻の空間平均同士）
+    """
+    targets_1h = ["Prec_Target_ft4", "Prec_Target_ft5", "Prec_Target_ft6"]
+    targets_all = targets_1h + ["Prec_4_6h_sum"]
+    feat_candidates = ["Prec_ft3", "hour_cos", "hour_sin", "dayofyear_cos", "dayofyear_sin"]
+
+    # 統計保持: {tgt: {feat: {n,sum_x,sum_x2,sum_y,sum_y2,sum_xy}}}
+    stats: Dict[str, Dict[str, Dict[str, float]]] = {t: {} for t in targets_all}
+    feats_available: set = set()
+
+    def ensure_stat(tgt: str, feat: str):
+        if feat not in stats[tgt]:
+            stats[tgt][feat] = {"n": 0.0, "sum_x": 0.0, "sum_x2": 0.0, "sum_y": 0.0, "sum_y2": 0.0, "sum_xy": 0.0}
+
+    def update_pair(tgt: str, feat: str, x: np.ndarray, y: np.ndarray):
+        # x,y: shape (tc,) の時系列（空間平均済み）
+        mask = np.isfinite(x) & np.isfinite(y)
+        if not np.any(mask):
+            return
+        xv = x[mask].astype(np.float64, copy=False)
+        yv = y[mask].astype(np.float64, copy=False)
+        ensure_stat(tgt, feat)
+        st = stats[tgt][feat]
+        st["n"] += float(xv.size)
+        st["sum_x"] += float(np.sum(xv))
+        st["sum_x2"] += float(np.sum(xv * xv))
+        st["sum_y"] += float(np.sum(yv))
+        st["sum_y2"] += float(np.sum(yv * yv))
+        st["sum_xy"] += float(np.sum(xv * yv))
+
+    def reduce_to_timeseries(arr: np.ndarray) -> np.ndarray:
+        # arr: (tc, ...). (tc,) -> そのまま, (tc,H,W)-> spatial mean, 他はflatten平均
+        if arr.ndim == 1:
+            return arr.astype(np.float64, copy=False)
+        if arr.ndim >= 2:
+            ax = tuple(range(1, arr.ndim))
+            return np.nanmean(arr, axis=ax)
+        # スカラー等は繰り返し（呼び出し側で長さ管理）
+        return np.asarray(arr, dtype=np.float64)
+
+    for fp in nc_files:
+        try:
+            with h5py.File(fp, "r") as f:
+                # 対象が最低限存在するか
+                present_tgts = [v for v in targets_1h if v in f]
+                has_sum = "Prec_4_6h_sum" in f
+                if not present_tgts and not has_sum:
+                    continue
+                # time軸
+                # まず1hターゲットのいずれか、無ければsumでtime軸検出
+                ref_name = present_tgts[0] if present_tgts else "Prec_4_6h_sum"
+                ds_ref = f[ref_name]; tax = guess_time_axis(ds_ref, f)
+                if tax is None:
+                    # 全読みで一括処理
+                    # ターゲット
+                    tgt_series: Dict[str, np.ndarray] = {}
+                    for tname in present_tgts:
+                        arr = apply_cf_scaling(f[tname][...], f[tname])
+                        tgt_series[tname] = reduce_to_timeseries(arr)
+                    if has_sum:
+                        arrs = apply_cf_scaling(f["Prec_4_6h_sum"][...], f["Prec_4_6h_sum"])
+                        tgt_series["Prec_4_6h_sum"] = reduce_to_timeseries(arrs)
+                    elif len(present_tgts) == 3:
+                        arrs = (apply_cf_scaling(f["Prec_Target_ft4"][...], f["Prec_Target_ft4"]) +
+                                apply_cf_scaling(f["Prec_Target_ft5"][...], f["Prec_Target_ft5"]) +
+                                apply_cf_scaling(f["Prec_Target_ft6"][...], f["Prec_Target_ft6"]))
+                        tgt_series["Prec_4_6h_sum"] = reduce_to_timeseries(arrs)
+                    # 特徴量（存在時）
+                    feat_series: Dict[str, np.ndarray] = {}
+                    for feat in feat_candidates:
+                        if feat in f:
+                            arr = apply_cf_scaling(f[feat][...], f[feat])
+                            feat_series[feat] = reduce_to_timeseries(arr)
+                            feats_available.add(feat)
+                    # 長さ整合（最小長さに合わせる）
+                    lengths = [len(v) for v in list(tgt_series.values()) + list(feat_series.values()) if hasattr(v, "__len__")]
+                    if not lengths:
+                        continue
+                    L = min(lengths)
+                    for k in tgt_series.keys():
+                        tgt_series[k] = tgt_series[k][:L]
+                    for k in feat_series.keys():
+                        feat_series[k] = feat_series[k][:L]
+                    # 更新
+                    for tname, ty in tgt_series.items():
+                        for fname, fx in feat_series.items():
+                            update_pair(tname, fname, fx, ty)
+                else:
+                    T = ds_ref.shape[tax]
+                    for t0 in range(0, T, time_chunk):
+                        t1 = min(T, t0 + time_chunk)
+                        # ターゲット
+                        tgt_series: Dict[str, np.ndarray] = {}
+                        for tname in present_tgts:
+                            arr = read_block(f[tname], tax, t0, t1)
+                            tgt_series[tname] = reduce_to_timeseries(arr)
+                        if has_sum:
+                            arrs = read_block(f["Prec_4_6h_sum"], tax, t0, t1)
+                            tgt_series["Prec_4_6h_sum"] = reduce_to_timeseries(arrs)
+                        elif len(present_tgts) == 3:
+                            arrs = (read_block(f["Prec_Target_ft4"], tax, t0, t1) +
+                                    read_block(f["Prec_Target_ft5"], tax, t0, t1) +
+                                    read_block(f["Prec_Target_ft6"], tax, t0, t1))
+                            tgt_series["Prec_4_6h_sum"] = reduce_to_timeseries(arrs)
+                        # 特徴量
+                        feat_series: Dict[str, np.ndarray] = {}
+                        for feat in feat_candidates:
+                            if feat in f:
+                                arr = read_block(f[feat], guess_time_axis(f[feat], f) or tax, t0, t1)
+                                feat_series[feat] = reduce_to_timeseries(arr)
+                                feats_available.add(feat)
+                        # 長さ整合（最小長に揃える）
+                        lengths = [len(v) for v in list(tgt_series.values()) + list(feat_series.values()) if hasattr(v, "__len__")]
+                        if not lengths:
+                            continue
+                        L = min(lengths)
+                        for k in tgt_series.keys():
+                            tgt_series[k] = tgt_series[k][:L]
+                        for k in feat_series.keys():
+                            feat_series[k] = feat_series[k][:L]
+                        # 更新
+                        for tname, ty in tgt_series.items():
+                            for fname, fx in feat_series.items():
+                                update_pair(tname, fname, fx, ty)
+        except Exception as e:
+            logging.warning(f"[REL] {Path(fp).name}: 関係解析中にエラー: {e}")
+
+    # 相関係数を計算
+    def to_pearson(st: Dict[str, float]) -> Optional[float]:
+        n = st["n"]
+        if n <= 1:
+            return None
+        sx, sx2, sy, sy2, sxy = st["sum_x"], st["sum_x2"], st["sum_y"], st["sum_y2"], st["sum_xy"]
+        num = sxy - (sx * sy / n)
+        denx = sx2 - (sx * sx / n)
+        deny = sy2 - (sy * sy / n)
+        den = denx * deny
+        if den <= 0:
+            return None
+        return float(num / np.sqrt(den))
+
+    pearson: Dict[str, Dict[str, Optional[float]]] = {t: {} for t in targets_all}
+    for t in stats.keys():
+        for f in stats[t].keys():
+            pearson[t][f] = to_pearson(stats[t][f])
+
+    # 季節性・日周期の強さ（rのベクトル合成）
+    def vec_amp(r_cos: Optional[float], r_sin: Optional[float]) -> Optional[float]:
+        if r_cos is None or r_sin is None:
+            return None
+        return float(np.sqrt(r_cos * r_cos + r_sin * r_sin))
+
+    diurnal_amp = {t: vec_amp(pearson[t].get("hour_cos"), pearson[t].get("hour_sin")) for t in pearson.keys()}
+    seasonal_amp = {t: vec_amp(pearson[t].get("dayofyear_cos"), pearson[t].get("dayofyear_sin")) for t in pearson.keys()}
+
+    return {
+        "features_available": sorted(list(feats_available)),
+        "targets": targets_all,
+        "pearson_r": pearson,
+        "diurnal_amplitude_r": diurnal_amp,
+        "seasonal_amplitude_r": seasonal_amp,
+    }
+
+def analyze_wet_stats(nc_files: List[Path], time_chunk: int, thr: float = 0.1) -> Dict[str, Any]:
+    """
+    Wet-hour(>thr mm)の画素比率（全体）と日周期(0..23h)のwet率(%)を算出。
+    - 対象: Prec_Target_ft4/5/6, Prec_4_6h_sum（sum欠損時はft4+ft5+ft6で代替）
+    - 日周期: hour_cos/hour_sin から算出（存在時のみ）
+    """
+    targets_1h = ["Prec_Target_ft4", "Prec_Target_ft5", "Prec_Target_ft6"]
+    target_sum_name = "Prec_4_6h_sum"
+    target_all = targets_1h + [target_sum_name]
+
+    overall = {k: {"wet": 0, "total": 0} for k in target_all}
+    diurnal_wet = {k: np.zeros(24, dtype=np.int64) for k in target_all}
+    diurnal_tot = {k: np.zeros(24, dtype=np.int64) for k in target_all}
+    diurnal_available_any = False
+
+    def reduce_ts(arr: np.ndarray) -> np.ndarray:
+        # 任意shape -> (tc,) の時系列（空間平均）
+        if arr.ndim == 1:
+            return arr.astype(np.float64, copy=False)
+        if arr.ndim >= 2:
+            return np.nanmean(arr, axis=tuple(range(1, arr.ndim))).astype(np.float64, copy=False)
+        return np.asarray(arr, dtype=np.float64)
+
+    for fp in nc_files:
+        try:
+            with h5py.File(fp, "r") as f:
+                # time軸（sum優先、無ければ1hのどれか）
+                ref_name = target_sum_name if target_sum_name in f else (targets_1h[0] if targets_1h[0] in f else (targets_1h[1] if targets_1h[1] in f else (targets_1h[2] if targets_1h[2] in f else None)))
+                if ref_name is None:
+                    continue
+                tax_ref = guess_time_axis(f[ref_name], f)
+                T = (f[ref_name].shape[tax_ref]) if tax_ref is not None else None
+
+                # 日周期用の hour_cos/hour_sin
+                has_hour = ("hour_cos" in f and "hour_sin" in f)
+                tax_hc = guess_time_axis(f["hour_cos"], f) if has_hour else None
+                tax_hs = guess_time_axis(f["hour_sin"], f) if has_hour else None
+                use_diurnal = has_hour and (tax_hc is not None) and (tax_hs is not None)
+
+                if tax_ref is None:
+                    # フル読み
+                    # hour 時系列（オプション）
+                    if use_diurnal:
+                        hc = apply_cf_scaling(f["hour_cos"][...], f["hour_cos"])
+                        hs = apply_cf_scaling(f["hour_sin"][...], f["hour_sin"])
+                        hc_ts = reduce_ts(hc); hs_ts = reduce_ts(hs)
+                        Lh = min(len(hc_ts), len(hs_ts))
+                        angle = np.arctan2(hs_ts[:Lh], hc_ts[:Lh])
+                        hour_idx = ((angle % (2 * np.pi)) / (2 * np.pi) * 24.0)
+                        hour_idx = np.floor(hour_idx).astype(np.int64) % 24
+                    else:
+                        hour_idx = None
+
+                    # 各ターゲット
+                    present_1h = [v for v in targets_1h if v in f]
+                    # 1h
+                    for v in present_1h:
+                        arr = apply_cf_scaling(f[v][...], f[v])
+                        finite = np.isfinite(arr)
+                        wet = (arr > thr) & finite
+                        if arr.ndim == 0:
+                            tc = 1
+                            wet_counts = np.array([int(wet)], dtype=np.int64)
+                            tot_counts = np.array([int(finite)], dtype=np.int64)
+                        else:
+                            # (tc,...) にそろっている保証が無いので、time次元が無い場合のケア
+                            if "time" in f and arr.shape[0] == f["time"].shape[0]:
+                                tc = arr.shape[0]
+                                wet_counts = wet.reshape(tc, -1).sum(axis=1)
+                                tot_counts = finite.reshape(tc, -1).sum(axis=1)
+                            else:
+                                # 時間情報なし -> 全体集計のみ
+                                tc = 1
+                                wet_counts = np.array([int(wet.sum())], dtype=np.int64)
+                                tot_counts = np.array([int(finite.sum())], dtype=np.int64)
+
+                        overall[v]["wet"] += int(wet_counts.sum())
+                        overall[v]["total"] += int(tot_counts.sum())
+                        if hour_idx is not None and len(hour_idx) >= len(wet_counts):
+                            diurnal_available_any = True
+                            L = min(len(hour_idx), len(wet_counts))
+                            for i in range(L):
+                                h = int(hour_idx[i])
+                                diurnal_wet[v][h] += int(wet_counts[i])
+                                diurnal_tot[v][h] += int(tot_counts[i])
+
+                    # sum
+                    if target_sum_name in f:
+                        arrs = apply_cf_scaling(f[target_sum_name][...], f[target_sum_name])
+                    elif len(present_1h) == 3:
+                        arrs = (apply_cf_scaling(f[targets_1h[0]][...], f[targets_1h[0]]) +
+                                apply_cf_scaling(f[targets_1h[1]][...], f[targets_1h[1]]) +
+                                apply_cf_scaling(f[targets_1h[2]][...], f[targets_1h[2]]))
+                    else:
+                        arrs = None
+                    if arrs is not None:
+                        finite = np.isfinite(arrs)
+                        wet = (arrs > thr) & finite
+                        if arrs.ndim == 0:
+                            wet_counts = np.array([int(wet)], dtype=np.int64)
+                            tot_counts = np.array([int(finite)], dtype=np.int64)
+                        else:
+                            if "time" in f and arrs.shape[0] == f["time"].shape[0]:
+                                tc = arrs.shape[0]
+                                wet_counts = wet.reshape(tc, -1).sum(axis=1)
+                                tot_counts = finite.reshape(tc, -1).sum(axis=1)
+                            else:
+                                tc = 1
+                                wet_counts = np.array([int(wet.sum())], dtype=np.int64)
+                                tot_counts = np.array([int(finite.sum())], dtype=np.int64)
+                        overall[target_sum_name]["wet"] += int(wet_counts.sum())
+                        overall[target_sum_name]["total"] += int(tot_counts.sum())
+                        if hour_idx is not None and len(hour_idx) >= len(wet_counts):
+                            diurnal_available_any = True
+                            L = min(len(hour_idx), len(wet_counts))
+                            for i in range(L):
+                                h = int(hour_idx[i])
+                                diurnal_wet[target_sum_name][h] += int(wet_counts[i])
+                                diurnal_tot[target_sum_name][h] += int(tot_counts[i])
+
+                else:
+                    # ブロック処理
+                    T = f[ref_name].shape[tax_ref]
+                    for t0 in range(0, T, time_chunk):
+                        t1 = min(T, t0 + time_chunk)
+                        # hour
+                        if use_diurnal:
+                            hc = read_block(f["hour_cos"], tax_hc, t0, t1)
+                            hs = read_block(f["hour_sin"], tax_hs, t0, t1)
+                            hc_ts = reduce_ts(hc); hs_ts = reduce_ts(hs)
+                            Lh = min(len(hc_ts), len(hs_ts))
+                            angle = np.arctan2(hs_ts[:Lh], hc_ts[:Lh])
+                            hour_idx = ((angle % (2 * np.pi)) / (2 * np.pi) * 24.0)
+                            hour_idx = np.floor(hour_idx).astype(np.int64) % 24
+                        else:
+                            hour_idx = None
+
+                        # 1hターゲット
+                        present_1h = [v for v in targets_1h if v in f]
+                        for v in present_1h:
+                            arr = read_block(f[v], tax_ref, t0, t1)
+                            finite = np.isfinite(arr)
+                            wet = (arr > thr) & finite
+                            if arr.ndim >= 2:
+                                tc = arr.shape[0]
+                                wet_counts = wet.reshape(tc, -1).sum(axis=1)
+                                tot_counts = finite.reshape(tc, -1).sum(axis=1)
+                            else:
+                                wet_counts = np.array([int(wet.sum())], dtype=np.int64)
+                                tot_counts = np.array([int(finite.sum())], dtype=np.int64)
+                            overall[v]["wet"] += int(wet_counts.sum())
+                            overall[v]["total"] += int(tot_counts.sum())
+                            if hour_idx is not None and len(hour_idx) >= len(wet_counts):
+                                diurnal_available_any = True
+                                L = min(len(hour_idx), len(wet_counts))
+                                for i in range(L):
+                                    h = int(hour_idx[i])
+                                    diurnal_wet[v][h] += int(wet_counts[i])
+                                    diurnal_tot[v][h] += int(tot_counts[i])
+
+                        # sum
+                        if target_sum_name in f:
+                            arrs = read_block(f[target_sum_name], tax_ref, t0, t1)
+                        elif len(present_1h) == 3:
+                            arrs = (read_block(f[targets_1h[0]], tax_ref, t0, t1) +
+                                    read_block(f[targets_1h[1]], tax_ref, t0, t1) +
+                                    read_block(f[targets_1h[2]], tax_ref, t0, t1))
+                        else:
+                            arrs = None
+                        if arrs is not None:
+                            finite = np.isfinite(arrs)
+                            wet = (arrs > thr) & finite
+                            if arrs.ndim >= 2:
+                                tc = arrs.shape[0]
+                                wet_counts = wet.reshape(tc, -1).sum(axis=1)
+                                tot_counts = finite.reshape(tc, -1).sum(axis=1)
+                            else:
+                                wet_counts = np.array([int(wet.sum())], dtype=np.int64)
+                                tot_counts = np.array([int(finite.sum())], dtype=np.int64)
+                            overall[target_sum_name]["wet"] += int(wet_counts.sum())
+                            overall[target_sum_name]["total"] += int(tot_counts.sum())
+                            if hour_idx is not None and len(hour_idx) >= len(wet_counts):
+                                diurnal_available_any = True
+                                L = min(len(hour_idx), len(wet_counts))
+                                for i in range(L):
+                                    h = int(hour_idx[i])
+                                    diurnal_wet[target_sum_name][h] += int(wet_counts[i])
+                                    diurnal_tot[target_sum_name][h] += int(tot_counts[i])
+        except Exception as e:
+            logging.warning(f"[WET] {Path(fp).name}: Wet-hour解析中にエラー: {e}")
+
+    # 率に変換
+    overall_out = {}
+    for k, d in overall.items():
+        wet = int(d["wet"]); tot = int(d["total"])
+        ratio = (wet / tot * 100.0) if tot > 0 else 0.0
+        overall_out[k] = {"wet": wet, "total": tot, "ratio_percent": ratio}
+
+    diurnal_ratio = None
+    if diurnal_available_any:
+        diurnal_ratio = {}
+        for k in target_all:
+            w = diurnal_wet[k].astype(np.float64)
+            t = diurnal_tot[k].astype(np.float64)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                r = np.where(t > 0, (w / t) * 100.0, 0.0)
+            diurnal_ratio[k] = r.tolist()
+
+    return {"threshold_mm": float(thr), "overall": overall_out, "diurnal_ratio": diurnal_ratio}
+
 def process_one_file(fp_str: str,
                      time_chunk: int,
                      chunk_log_interval: int,
@@ -515,6 +1030,15 @@ def main():
     parser.add_argument("--log-chunk-every", type=int, default=5, help="チャンク進捗ログの間隔（Nチャンク毎に1回, DEBUG時のみ出力）")
     parser.add_argument("--prec-sum-tol", type=float, default=1e-6, help="Prec_4_6h_sum と和の許容絶対誤差 (mm)")
     parser.add_argument("--workers", type=int, default=0, help="並列ワーカー数（0で自動）")
+    # 追加オプション: 詳細分析
+    parser.add_argument("--analyze-bins", action="store_true",
+                        help="1時間降水/3時間積算の強度ビン分布を併せて出力（元 analyze_1h_bin_distribution.py の統合）")
+    parser.add_argument("--analyze-relations", action="store_true",
+                        help="降水（時系列の空間平均）と予測変数（Prec_ft3, day/hourのcos/sin）の相関関係を出力")
+    parser.add_argument("--analyze-wet", action="store_true",
+                        help="Wet-hour(>閾値)の画素比率や日周期(0..23h)分布を出力")
+    parser.add_argument("--wet-thr", type=float, default=0.1,
+                        help="Wet-hour判定のしきい値(mm)。既定=0.1mm")
     args = parser.parse_args()
 
     setup_logger(args.verbose)
@@ -779,7 +1303,86 @@ def main():
     if not issues_any:
         print("[OK] 全変数で NaN/Inf/外れ値の検出なし（設定レンジ内）")
 
+    # 追加: 降水ビン分布と関係解析
+    bin_dist_report = None
+    relations_report = None
+    wet_stats_report = None
+
+    if args.analyze_bins:
+        print("\n================== 降水 強度ビン分布（統合版） ==================")
+        t0 = time.time()
+        bin_dist_report = analyze_bin_distributions(nc_files, time_chunk)
+        # 表示（全体 + 各1hターゲット + 積算）
+        overall = bin_dist_report["overall_1h"]
+        print(f"[1h 合計] 総画素数: {overall['total']:,}")
+        for i, label in enumerate(BIN_LABELS_1H):
+            cnt = int(overall["counts"][i]); ratio = float(overall["ratios"][i])
+            print(f"  Bin {label:>6}: count={cnt:,}  ratio={ratio:6.3f}%")
+        print("------------------------------------------------------------------------------------")
+        for v, d in bin_dist_report["per_var_1h"].items():
+            print(f"{v}: total={int(d['total']):,}")
+            for i, label in enumerate(BIN_LABELS_1H):
+                cnt = int(d["counts"][i]); ratio = float(d["ratios"][i])
+                print(f"  Bin {label:>6}: count={cnt:,}  ratio={ratio:6.3f}%")
+            print("------------------------------------------------------------------------------------")
+        overall_sum = bin_dist_report["overall_sum"]
+        print(f"[3h 積算] 総画素数: {overall_sum['total']:,}")
+        for i, label in enumerate(SUM_BIN_LABELS):
+            cnt = int(overall_sum["counts"][i]); ratio = float(overall_sum["ratios"][i])
+            print(f"  Bin {label:>6}: count={cnt:,}  ratio={ratio:6.3f}%")
+        print(f"[INFO] ビン分布解析 所要時間: {time.time() - t0:.2f}s")
+
+    if args.analyze_relations:
+        print("\n================== 降水と予測変数の関係（時系列・空間平均の相関） ==================")
+        t0 = time.time()
+        relations_report = analyze_relations(nc_files, time_chunk)
+        feats = relations_report["features_available"]
+        print(f"[INFO] 解析対象特徴量: {', '.join(feats) if feats else '(なし)'}")
+        if feats:
+            pear = relations_report["pearson_r"]
+            for tgt in relations_report["targets"]:
+                if tgt not in pear:
+                    continue
+                print(f"--- Target: {tgt} ---")
+                for feat in feats:
+                    r = pear[tgt].get(feat, None)
+                    if r is None:
+                        print(f"  r({feat}) = N/A")
+                    else:
+                        print(f"  r({feat}) = {r:+.3f}")
+                # ベクトル合成の強さ
+                dh = relations_report["diurnal_amplitude_r"].get(tgt)
+                ds = relations_report["seasonal_amplitude_r"].get(tgt)
+                if dh is not None:
+                    print(f"  |diurnal (hour_cos/sin)| = {dh:.3f}")
+                if ds is not None:
+                    print(f"  |seasonal (doy_cos/sin)| = {ds:.3f}")
+        print(f"[INFO] 関係解析 所要時間: {time.time() - t0:.2f}s")
+
+    if args.analyze_wet:
+        print("\n================== Wet-hour 比率と日周期分布 ==================")
+        t0 = time.time()
+        wet_stats_report = analyze_wet_stats(nc_files, time_chunk, thr=float(args.wet_thr))
+        thr = wet_stats_report.get("threshold_mm", 0.1)
+        overall = wet_stats_report.get("overall", {})
+        for var, d in overall.items():
+            wet = int(d.get("wet", 0)); tot = int(d.get("total", 0))
+            ratio = (wet / tot * 100.0) if tot > 0 else 0.0
+            print(f"{var:16s}: wet={wet:,} / total={tot:,}  ratio={ratio:6.3f}%  (thr={thr}mm)")
+        diurnal = wet_stats_report.get("diurnal_ratio", None)
+        if diurnal:
+            print("\n[日周期（hour=0..23 のwet率%）]")
+            for var, arr in diurnal.items():
+                arrf = [f"{x:5.2f}" for x in arr]
+                print(f"{var:16s}: " + " ".join(arrf))
+        print(f"[INFO] Wet-hour解析 所要時間: {time.time() - t0:.2f}s")
+
     # JSONレポート
+    # 追加キーのためのローカル変数を保持（None可）
+    _bin_dist_for_json = bin_dist_report
+    _relations_for_json = relations_report
+    _wet_stats_for_json = wet_stats_report
+
     report = {
         "dir": str(base_dir),
         "period": {"start": args.start, "end": args.end},
@@ -791,6 +1394,9 @@ def main():
         "circular_features": circular_feature_results,
         "precip_sum_checks": precip_sum_checks,
         "var_stats": var_stats,
+        "bin_distribution": _bin_dist_for_json,
+        "relations": _relations_for_json,
+        "wet_stats": _wet_stats_for_json,
         "notes": [
             "allowed_range は名前・units・一部の値域から保守的に推定しています。",
             "用途に応じて decide_allowed_range() のレンジを調整してください。",

@@ -84,13 +84,17 @@ class WindowAttention(nn.Module):
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
         attn = attn + relative_position_bias.unsqueeze(0)
 
+        # Compute softmax in float32 for numerical stability under AMP
+        attn = attn.float()
         if mask is not None:
             nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N)
+            attn = attn + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.softmax(attn)
-        else:
-            attn = self.softmax(attn)
+        # subtract max for stability before softmax
+        attn = attn - attn.max(dim=-1, keepdim=True).values
+        attn = self.softmax(attn)
+        attn = attn.to(v.dtype)
 
         attn = self.attn_drop(attn)
 

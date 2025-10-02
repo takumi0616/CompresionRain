@@ -12,7 +12,6 @@
 import os
 import glob
 import warnings
-import hdf5plugin
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from matplotlib.colors import LogNorm
@@ -24,6 +23,24 @@ import torch.nn as nn
 import xarray as xr
 from swin_unet import SwinTransformerSys
 from torch.amp import GradScaler, autocast
+from swinunet_main_v5_config import (
+    CFG, SEED,
+    DATA_DIR, TRAIN_YEARS, VALID_YEARS,
+    RESULT_DIR, MODEL_SAVE_PATH, PLOT_SAVE_PATH, RESULT_IMG_DIR,
+    MAIN_LOG_PATH, EXEC_LOG_PATH, EVALUATION_LOG_PATH, EPOCH_METRIC_PLOT_DIR,
+    VIDEO_OUTPUT_PATH, VIDEO_FPS,
+    NUM_WORKERS, BATCH_SIZE, NUM_EPOCHS, LEARNING_RATE,
+    IMG_SIZE, PATCH_SIZE, NUM_CLASSES, IN_CHANS,
+    INPUT_VARS_COMMON, INPUT_VARS_PREC, TIME_VARS,
+    TARGET_VARS_1H, TARGET_VAR_SUM,
+    ENABLE_INTENSITY_WEIGHTED_LOSS,
+    INTENSITY_WEIGHT_BINS_1H, INTENSITY_WEIGHT_VALUES_1H,
+    INTENSITY_WEIGHT_BINS_SUM, INTENSITY_WEIGHT_VALUES_SUM,
+    BINARY_THRESHOLDS_MM_1H, BINARY_THRESHOLDS_MM_SUM,
+    CATEGORY_BINS_MM_1H, CATEGORY_BINS_MM_SUM,
+    WETHOUR_THRESHOLD_MM, LOGNORM_VMIN_MM,
+    MODEL_ARGS, AMP_DTYPE
+)
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -32,99 +49,46 @@ import logging
 import sys
 import random
 from bisect import bisect_right
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
+# 任意依存関係（存在しない場合は機能をスキップ）
+try:
+    import hdf5plugin  # noqa: F401
+    HDF5PLUGIN_AVAILABLE = True
+except Exception as e:
+    HDF5PLUGIN_AVAILABLE = False
+    warnings.warn(f"hdf5plugin が見つからないため、NetCDFの一部圧縮フィルタが利用できない可能性があります: {e}")
+
+try:
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    CARTOPY_AVAILABLE = True
+except Exception as e:
+    CARTOPY_AVAILABLE = False
+    ccrs = None
+    cfeature = None
+    warnings.warn(f"Cartopy が見つからないため、地図付き可視化をスキップします: {e}")
 
 # 画像→動画化用（imageioが未インストールの場合はスキップ）
-import imageio.v2 as imageio
-IMAGEIO_AVAILABLE = True
-CARTOPY_AVAILABLE = True
+try:
+    import imageio.v2 as imageio
+    IMAGEIO_AVAILABLE = True
+except Exception as e:
+    IMAGEIO_AVAILABLE = False
+    imageio = None
+    warnings.warn(f"imageio が見つからないため、動画作成をスキップします: {e}")
 
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
 os.environ['HDF5_DISABLE_VERSION_CHECK'] = '1'
 
+# AMP dtype mapping from config ("fp16" or "bf16")
+AMP_TORCH_DTYPE = torch.float16 if AMP_DTYPE == 'fp16' else torch.bfloat16
+
 # ==============================================================================
 # 1. 設定 & ハイパーパラメータ
 # ==============================================================================
 
-# --- データパス設定 ---
-DATA_DIR = './output_nc'
-TRAIN_YEARS = [2018, 2019, 2020, 2021]
-VALID_YEARS = [2022]
-
-# --- 結果の保存先ディレクトリ（v5） ---
-RESULT_DIR = 'swin-unet_main_result_v5'
-
-# モデル、プロット、ログの保存先パス（v5）
-MODEL_SAVE_PATH = os.path.join(RESULT_DIR, 'best_swin_unet_model_ddp_monthly_v5.pth')
-PLOT_SAVE_PATH = os.path.join(RESULT_DIR, 'loss_curve_monthly_v5.png')
-RESULT_IMG_DIR = os.path.join(RESULT_DIR, 'result_images_monthly_v5')
-MAIN_LOG_PATH = os.path.join(RESULT_DIR, 'main_v5.log')
-EXEC_LOG_PATH = os.path.join(RESULT_DIR, 'execution_v5.log')
-EVALUATION_LOG_PATH = os.path.join(RESULT_DIR, 'evaluation_v5.log')
-
-# 追加: エポックメトリクスの図出力ディレクトリ（v5）
-EPOCH_METRIC_PLOT_DIR = os.path.join(RESULT_DIR, 'epoch_metrics_plots_v5')
-
-# 追加: 画像→動画の出力先（v5）
-VIDEO_OUTPUT_PATH = os.path.join(RESULT_DIR, 'validation_results_v5.mp4')
-VIDEO_FPS = 2  # 0.5秒/枚 = 2fps
-
-NUM_WORKERS = 4
-
-# --- 学習パラメータ ---
-BATCH_SIZE = 8
-NUM_EPOCHS = 60
-LEARNING_RATE = 1e-4
-
 # --- 再現性確保のための乱数シード設定 ---
-RANDOM_SEED = 1
-
-# --- モデルパラメータ ---
-IMG_SIZE = 480
-PATCH_SIZE = 4
-NUM_CLASSES = 3
-
-# --- 変数定義 ---
-INPUT_VARS_COMMON = [
-    'Prmsl', 'U10m', 'V10m', 'T2m', 'U975', 'V975', 'T975',
-    'U950', 'V950', 'T950', 'U925', 'V925', 'T925', 'R925',
-    'U850', 'V850', 'T850', 'R850', 'GH500', 'T500', 'R500',
-    'GH300', 'U300', 'V300'
-]
-INPUT_VARS_PREC = ['Prec_ft3']
-TIME_VARS = ['dayofyear_sin', 'dayofyear_cos', 'hour_sin', 'hour_cos']
-TARGET_VARS_1H = ['Prec_Target_ft4', 'Prec_Target_ft5', 'Prec_Target_ft6']
-TARGET_VAR_SUM = 'Prec_4_6h_sum'
-IN_CHANS = len(INPUT_VARS_COMMON) * 2 + len(INPUT_VARS_PREC) + len(TIME_VARS)
-
-# --- 評価系の追加設定 ---
-# 2値判定のしきい値（例: 0.0, 0.1, 1, 5, 10, 20, 30, 50 mm）
-# 1時間と3時間積算で別閾値（sumは1hの2倍スケール）
-BINARY_THRESHOLDS_MM_1H = [0.0, 0.1, 1.0, 5.0, 10.0, 20.0, 30.0, 50.0]
-BINARY_THRESHOLDS_MM_SUM = [0.0, 0.2, 2.0, 10.0, 20.0, 40.0, 60.0, 100.0]
-# カテゴリ分類のビン（sumは1hの2倍スケール）
-CATEGORY_BINS_MM_1H = [0.0, 5.0, 10.0, 20.0, 30.0, 50.0, float('inf')]
-CATEGORY_BINS_MM_SUM = [0.0, 10.0, 20.0, 40.0, 60.0, 100.0, float('inf')]
-# 「降水あり時間数」の判定しきい値（>= 0.1mm を降水ありと判定）
-WETHOUR_THRESHOLD_MM = 0.1
-
-# 可視化（対数表示）の最小値（これ未満は透明扱い）
-LOGNORM_VMIN_MM = 0.1
-
-# --- v5: 強度重み付けロスの設定（1hとsumで方針分離） ---
-ENABLE_INTENSITY_WEIGHTED_LOSS = True  # Trueで有効化
-# 1時間降水の重み（ビン境界と各ビンの重み）
-# 境界は [1, 5, 10, 20, 30, 50]（右開区間）。重みは len(boundaries)+1 個。
-INTENSITY_WEIGHT_BINS_1H = [1.0, 5.0, 10.0, 20.0, 30.0, 50.0]  # mm/h
-INTENSITY_WEIGHT_VALUES_1H = [1.0, 1.1, 1.3, 2.2, 9.7, 25.7, 100.0]
-
-# 3時間積算（sum）は1hの2倍スケールのビン境界＋段階的な整数重み（頻度不均衡の緩和）
-# 例: 1hの50mmに対してsumは100mmまで（2倍スケール）
-INTENSITY_WEIGHT_BINS_SUM = [2.0, 10.0, 20.0, 40.0, 60.0, 100.0]  # mm/3h
-# 不均衡を考慮した穏やかな昇順の整数重み（過度に大きな係数は避けつつ、強雨ほど重視）
-INTENSITY_WEIGHT_VALUES_SUM = [1.0, 2.0, 3.0, 6.0, 9.0, 12.0, 16.0]
+RANDOM_SEED = SEED
 
 # ==============================================================================
 # 1.5. 再現性確保のための関数
@@ -335,52 +299,66 @@ def _get_weight_map_from_bins(target_tensor, bin_edges, weight_values):
     weight_values: 各ビンの重み（len = len(bin_edges)+1）
     戻り: target_tensorと同shapeの重みテンソル
     """
+    # 数値安定化のため、ビニングと重み計算は常に float32 で実施（AMP下のhalfでのオーバーフロー回避）
     device = target_tensor.device
-    dtype = target_tensor.dtype
-    boundaries_t = torch.tensor(bin_edges, device=device, dtype=dtype)
-    idx = torch.bucketize(target_tensor, boundaries_t, right=False)  # 0..len(boundaries)
-    wvals_t = torch.tensor(weight_values, device=device, dtype=dtype)  # len = len(boundaries)+1
+    t = target_tensor.float()
+    boundaries_t = torch.tensor(bin_edges, device=device, dtype=torch.float32)
+    idx = torch.bucketize(t, boundaries_t, right=False)  # 0..len(boundaries)
+    wvals_t = torch.tensor(weight_values, device=device, dtype=torch.float32)  # len = len(boundaries)+1
     weights = wvals_t[idx]
     return weights
 
 def _weighted_mse(pred, target, bin_edges, weight_values, eps=1e-8):
     """
     加重MSE: sum(w * (pred-target)^2) / sum(w)
+    注意: AMP(fp16/bf16) 下でもオーバーフローしないよう、計算は float32 で実施
     """
-    weights = _get_weight_map_from_bins(target, bin_edges, weight_values)
-    se = (pred - target) ** 2
-    num = (weights * se).sum()
-    den = weights.sum() + eps
+    pred_f = pred.float()
+    target_f = target.float()
+    weights = _get_weight_map_from_bins(target_f, bin_edges, weight_values)  # float32
+    se = (pred_f - target_f) ** 2
+    num = (weights * se).sum(dtype=torch.float32)
+    den = weights.sum(dtype=torch.float32) + torch.tensor(eps, device=weights.device, dtype=torch.float32)
     return num / den
 
-def custom_loss_function(output, targets):
+def custom_loss_function(output, targets, eps=1e-8):
     """
     v5: 1hは強度重み付きMSE、sumも2倍スケールのビン＋整数重みで強度重み付きMSEを適用。
         （ログ用RMSEは従来通り、非加重MSEから算出）
+    数値安定化:
+      - モデル出力/ターゲットは float32 で計算（AMP下のhalfの和でInf→NaNを防止）
+      - RMSEのsqrtは負値を避けるためにclamp
     """
-    output = torch.relu(output)
-    target_1h = targets['target_1h']
-    predicted_sum = torch.sum(output, dim=1, keepdim=True)
-    target_sum = targets['target_sum']
+    # 物理量制約: 負の降水は0に、NaN/Infは安全値に置換
+    output = torch.nan_to_num(output, nan=0.0, posinf=1e6, neginf=0.0)
+    output = torch.relu(output).float()
+    target_1h = torch.nan_to_num(targets['target_1h'], nan=0.0, posinf=1e6, neginf=0.0).float()
+    target_sum = torch.nan_to_num(targets['target_sum'], nan=0.0, posinf=1e6, neginf=0.0).float()
+    # 物理的上限のクリッピング（極端値による勾配爆発を回避）
+    output = torch.clamp(output, min=0.0, max=500.0)
+    target_1h = torch.clamp(target_1h, min=0.0, max=500.0)
+    target_sum = torch.clamp(target_sum, min=0.0, max=1500.0)
 
-    # 非加重MSE（RMSE計算用）
+    predicted_sum = torch.sum(output, dim=1, keepdim=True)
+
+    # 非加重MSE（RMSE計算用, float32）
     unweighted_mse_1h = nn.functional.mse_loss(output, target_1h)
     unweighted_mse_sum = nn.functional.mse_loss(predicted_sum, target_sum)
 
     if ENABLE_INTENSITY_WEIGHTED_LOSS:
-        # 1時間（3ch）は強度重み付きMSE
+        # 1時間（3ch）は強度重み付きMSE（計算はfloat32）
         loss_1h_mse = _weighted_mse(output, target_1h, INTENSITY_WEIGHT_BINS_1H, INTENSITY_WEIGHT_VALUES_1H)
-        # sumは非加重（全て1.0の重み）にして水収支整合を重視
+        # sumも強度重み付きMSE（または非加重にするなら値を全て1.0に設定）
         loss_sum_mse = _weighted_mse(predicted_sum, target_sum, INTENSITY_WEIGHT_BINS_SUM, INTENSITY_WEIGHT_VALUES_SUM)
     else:
         loss_1h_mse = unweighted_mse_1h
         loss_sum_mse = unweighted_mse_sum
 
-    total_loss = loss_1h_mse + loss_sum_mse
+    total_loss = (loss_1h_mse + loss_sum_mse).float()
 
     with torch.no_grad():
-        rmse_1h = torch.sqrt(unweighted_mse_1h)
-        rmse_sum = torch.sqrt(unweighted_mse_sum)
+        rmse_1h = torch.sqrt(torch.clamp(unweighted_mse_1h, min=eps)).float()
+        rmse_sum = torch.sqrt(torch.clamp(unweighted_mse_sum, min=eps)).float()
 
     return total_loss, rmse_1h, rmse_sum
 
@@ -399,10 +377,19 @@ def train_one_epoch(rank, model, dataloader, optimizer, scaler, epoch, exec_log_
             inputs = batch['input'].to(rank, non_blocking=True)
             targets = {k: v.to(rank, non_blocking=True) for k, v in batch.items() if k != 'input'}
             optimizer.zero_grad(set_to_none=True)
-            with autocast(device_type='cuda', dtype=torch.float16):
+            with autocast(device_type='cuda', dtype=AMP_TORCH_DTYPE):
                 outputs = model(inputs)
                 loss, loss_1h, loss_sum = custom_loss_function(outputs, targets)
+            # 非有限値の検出とスキップ（DDP安定のためゼログラドしてcontinue）
+            if not torch.isfinite(loss):
+                if rank == 0:
+                    progress_bar.write(f"Warning: non-finite loss detected. Skipping batch. loss={loss.item()}")
+                optimizer.zero_grad(set_to_none=True)
+                continue
             scaler.scale(loss).backward()
+            # AMP下の勾配を一度unscaleしてからクリッピング（NaN/Inf対策）
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             total_loss += loss.item()
@@ -475,7 +462,7 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
             inputs = batch['input'].to(rank, non_blocking=True)
             targets = {k: v.to(rank, non_blocking=True) for k, v in batch.items() if k != 'input'}
 
-            with autocast(device_type='cuda', dtype=torch.float16):
+            with autocast(device_type='cuda', dtype=AMP_TORCH_DTYPE):
                 outputs = model(inputs)
                 loss, loss_1h, loss_sum = custom_loss_function(outputs, targets)
 
@@ -660,11 +647,7 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
         return
 
     device = torch.device(f"cuda:{rank}")
-    model = SwinTransformerSys(
-        img_size=IMG_SIZE, patch_size=PATCH_SIZE, in_chans=IN_CHANS, num_classes=NUM_CLASSES,
-        embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=15,
-        mlp_ratio=4., qkv_bias=True, norm_layer=nn.LayerNorm, use_checkpoint=False
-    ).to(device)
+    model = SwinTransformerSys(**MODEL_ARGS).to(device)
     model.load_state_dict(torch.load(best_model_path, map_location=device))
     model.eval()
 
@@ -692,7 +675,7 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             target_1h = sample['target_1h']  # (3, H, W)
             target_sum = target_1h.sum(dim=0, keepdim=False)  # (H, W)
 
-            with autocast(device_type='cuda', dtype=torch.float16):
+            with autocast(device_type='cuda', dtype=AMP_TORCH_DTYPE):
                 output = model(inputs)
             output = torch.relu(output).squeeze(0).cpu()  # (3, H, W)
             pred_sum = output.sum(dim=0)  # (H, W)
@@ -914,11 +897,7 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
     """最終モデルの評価（v5仕様: 拡張メトリクスを一括計算）"""
     main_logger.info("Starting final model evaluation (v5)...")
     
-    model = SwinTransformerSys(
-        img_size=IMG_SIZE, patch_size=PATCH_SIZE, in_chans=IN_CHANS, num_classes=NUM_CLASSES,
-        embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=15,
-        mlp_ratio=4., qkv_bias=True, norm_layer=nn.LayerNorm, use_checkpoint=False
-    ).to(device)
+    model = SwinTransformerSys(**MODEL_ARGS).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
@@ -947,7 +926,7 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
         targ_1h = batch['target_1h'].to(device)
         targ_sum = batch['target_sum'].to(device)
 
-        with autocast(device_type='cuda', dtype=torch.float16):
+        with autocast(device_type='cuda', dtype=AMP_TORCH_DTYPE):
             outputs = model(inputs)
         outputs = torch.relu(outputs)
 
@@ -1160,16 +1139,12 @@ def main_worker(rank, world_size, train_files, valid_files):
     valid_sampler = DistributedSampler(valid_dataset, num_replicas=world_size, rank=rank, shuffle=False)
     valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True, sampler=valid_sampler)
     
-    model = SwinTransformerSys(
-        img_size=IMG_SIZE, patch_size=PATCH_SIZE, in_chans=IN_CHANS, num_classes=NUM_CLASSES,
-        embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=15,
-        mlp_ratio=4., qkv_bias=True, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
-        norm_layer=nn.LayerNorm, ape=False, patch_norm=True, use_checkpoint=False
-    ).to(rank)
+    model = SwinTransformerSys(**MODEL_ARGS).to(rank)
     model = DDP(model, device_ids=[rank], find_unused_parameters=False)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * world_size)
-    scaler = GradScaler()
+    # fp16 のみ GradScaler を有効化（bf16は不要）
+    scaler = GradScaler(enabled=(AMP_DTYPE == 'fp16'))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
 
     if rank == 0:
@@ -1270,18 +1245,21 @@ if __name__ == '__main__':
     
     main_logger, _ = setup_loggers()
 
-    main_logger.info("Cartopyの地図データを事前にダウンロードします...")
-    try:
-        # ダミーのプロットを作成して、COASTLINEとBORDERSのデータをダウンロードさせる
-        # これにより、並列プロセスが同時にダウンロードするのを防ぐ
-        fig_pre = plt.figure()
-        ax_pre = plt.axes(projection=ccrs.PlateCarree())
-        ax_pre.add_feature(cfeature.COASTLINE)
-        ax_pre.add_feature(cfeature.BORDERS)
-        plt.close(fig_pre)
-        main_logger.info("Cartopyのデータダウンロードが完了しました。")
-    except Exception as e:
-        main_logger.warning(f"Cartopyのデータ事前ダウンロード中にエラーが発生しました: {e}")
+    if CARTOPY_AVAILABLE:
+        main_logger.info("Cartopyの地図データを事前にダウンロードします...")
+        try:
+            # ダミーのプロットを作成して、COASTLINEとBORDERSのデータをダウンロードさせる
+            # これにより、並列プロセスが同時にダウンロードするのを防ぐ
+            fig_pre = plt.figure()
+            ax_pre = plt.axes(projection=ccrs.PlateCarree())
+            ax_pre.add_feature(cfeature.COASTLINE)
+            ax_pre.add_feature(cfeature.BORDERS)
+            plt.close(fig_pre)
+            main_logger.info("Cartopyのデータダウンロードが完了しました。")
+        except Exception as e:
+            main_logger.warning(f"Cartopyのデータ事前ダウンロード中にエラーが発生しました: {e}")
+    else:
+        main_logger.warning("Cartopyが利用できないため、地図データの事前ダウンロードと地図付き可視化をスキップします。")
 
     main_logger.info(f"データディレクトリ: {DATA_DIR}")
     main_logger.info(f"現在の作業ディレクトリ: {os.getcwd()}")
