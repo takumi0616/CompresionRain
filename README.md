@@ -35,7 +35,7 @@ nohup python check_output_nc.py > check_output_nc.log 2>&1 &
 ```bash
 pkill -f "swinunet_main_v1.py"
 
-pkill -f "swinunet_main_v2.py"
+pkill -f "optimization_nc_data.py"
 
 pkill -f "convert_data_v1.py"
 

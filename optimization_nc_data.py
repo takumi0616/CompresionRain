@@ -25,7 +25,7 @@ END_YEAR = 2023
 
 # 並列処理ワーカー数 (マシンのCPUコア数に合わせて調整)
 # メモリ使用量とディスクI/Oを考慮し、CPUコア数より少し少なめに設定するのも良い
-MAX_WORKERS = 16
+MAX_WORKERS = 20
 
 # --- パス設定 ---
 # このスクリプトが存在するディレクトリを基準にパスを構築
@@ -171,22 +171,27 @@ def calculate_and_save_group_scales(file_paths, scaler_path, target_variables, g
         scales = []
         group_names = []
         logging.info("Aggregating std within groups to produce group scales...")
-        for group, vars_in_group in group_to_vars.items():
-            # 対象変数のみを選択
-            sel = std_by_var.sel(variable=[v for v in vars_in_group if v in std_by_var['variable'].values])
-            # グループ内平均（variable 次元で平均）: shape (lat, lon)
-            group_scale = sel.mean(dim='variable', skipna=True)
-            group_scale = group_scale.rename('scale')
-            scales.append(group_scale)
-            group_names.append(group)
+        with tqdm(total=len(group_to_vars), desc="グループスケール集計", leave=False, file=os.sys.stderr) as pbar:
+            for group, vars_in_group in group_to_vars.items():
+                # 対象変数のみを選択
+                sel = std_by_var.sel(variable=[v for v in vars_in_group if v in std_by_var['variable'].values])
+                # グループ内平均（variable 次元で平均）: shape (lat, lon)
+                group_scale = sel.mean(dim='variable', skipna=True)
+                group_scale = group_scale.rename('scale')
+                scales.append(group_scale)
+                group_names.append(group)
+                pbar.set_postfix_str(group)
+                pbar.update(1)
 
         # 連結して (group, lat, lon) の DataArray に
         scale_da = xr.concat(scales, dim=xr.DataArray(group_names, dims='group', name='group'))
         # Dataset 化
         scaler_ds = xr.Dataset({'scale': scale_da})
 
-        # 保存
-        scaler_ds.to_netcdf(scaler_path)
+        # 保存（進捗表示）
+        logging.info("Saving group scales to NetCDF...")
+        with ProgressBar():
+            scaler_ds.to_netcdf(scaler_path)
         logging.info(f"✅ Group scales saved successfully to: {scaler_path}")
         return scaler_ds
 
@@ -202,10 +207,10 @@ def optimize_monthly_netcdf(file_path, output_path, scaler_path, var_to_group, t
     """
     try:
         if output_path.exists():
-            logging.info(f"Skipping: {output_path} already exists.")
+            logging.info(f"スキップ: 既に存在します -> {output_path}")
             return f"Skipped: {file_path.name}"
 
-        logging.debug(f"Processing: {file_path.name}")
+        logging.info(f"処理開始: {file_path.name}")
 
         # 各ワーカー内でスケーラを開く（プロセス間共有より軽量）
         scaler_ds = xr.open_dataset(scaler_path)
@@ -215,19 +220,23 @@ def optimize_monthly_netcdf(file_path, output_path, scaler_path, var_to_group, t
             drop_vars = [v for v in TIME_FEATURE_VARS if v in ds]
             if drop_vars:
                 ds = ds.drop_vars(drop_vars)
-                logging.debug(f"Dropped time features: {drop_vars}")
+                logging.info(f"時間特徴を除去: {drop_vars}")
 
             # 正規化（x / scale）: グループの scale(lat,lon) を使用
-            for var_name in target_variables:
-                if var_name in ds and var_name in var_to_group:
+            variables_to_norm = [v for v in target_variables if v in ds and v in var_to_group]
+            logging.info(f"{file_path.name}: 正規化対象変数 = {len(variables_to_norm)} 個（除外: 時間特徴 {len(drop_vars)} 個）")
+            with tqdm(total=len(variables_to_norm), desc=f"正規化中 {file_path.name}", leave=False, file=os.sys.stderr) as pbar:
+                for var_name in variables_to_norm:
                     group = var_to_group[var_name]
                     if 'scale' not in scaler_ds or group not in scaler_ds['scale']['group'].values:
                         # スケール不在（整合性の問題）→スキップして警告
                         logging.warning(f"Scale for group '{group}' not found; skipping normalization for '{var_name}'")
+                        pbar.update(1)
                         continue
                     scale = scaler_ds['scale'].sel(group=group, drop=True)  # dims: (lat, lon)
                     # ブロードキャストで (time, lat, lon) に適用
                     ds[var_name] = ds[var_name] / scale
+                    pbar.update(1)
 
             # 圧縮設定
             encoding = {}
@@ -243,6 +252,7 @@ def optimize_monthly_netcdf(file_path, output_path, scaler_path, var_to_group, t
                     # 2次元変数などはデフォルト圧縮のみにする
                     encoding[var] = {**hdf5plugin.LZ4()}
 
+            logging.info(f"NetCDF 書き出し設定: 変数数={len(ds.data_vars)}, 圧縮設定対象={len(encoding)}")
             write_job = ds.to_netcdf(
                 output_path,
                 engine='h5netcdf',
@@ -254,7 +264,7 @@ def optimize_monthly_netcdf(file_path, output_path, scaler_path, var_to_group, t
             with ProgressBar():
                 write_job.compute()
 
-            logging.debug(f"Successfully created: {output_path.name}")
+            logging.info(f"✅ 出力完了: {output_path.name}")
             return f"Success: {file_path.name}"
 
     except Exception as e:
@@ -290,9 +300,14 @@ def main():
     # ターゲット変数とグループ決定（先頭ファイルで構造取得）
     with xr.open_dataset(file_paths[0]) as temp_ds:
         target_variables = get_target_variables(temp_ds)
+        dims_info = {k: int(v) for k, v in temp_ds.dims.items()}
+        logging.info(f"先頭ファイルの次元: {dims_info}")
+        logging.info(f"座標: {list(temp_ds.coords)}")
     var_to_group, group_to_vars = build_group_map(target_variables)
     logging.info(f"Target variables for normalization ({len(target_variables)}): {target_variables}")
     logging.info(f"Number of groups: {len(group_to_vars)}")
+    preview = {g: len(vs) for g, vs in list(group_to_vars.items())[:10]}
+    logging.info(f"グループの例（最大10件）: {preview}")
 
     # スケーラ準備
     if SCALER_FILE.exists():
@@ -343,7 +358,7 @@ def main():
 
             for future in concurrent.futures.as_completed(futures):
                 result = future.result()
-                logging.debug(result)
+                logging.info(result)
                 pbar.update(1)
 
     process_elapsed = time.time() - process_start_time
