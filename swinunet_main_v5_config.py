@@ -92,13 +92,13 @@ CFG = {
     },
     "TRAINING": {
         "epochs": 60,
-        "amp_dtype": "fp16",      # "fp16" もしくは "bf16"
+        "amp_dtype": "bf16",      # "fp16" もしくは "bf16" - bf16は数値安定性が高い
         "use_grad_scaler": True,
         "ddp_find_unused_parameters": False,
     },
     "OPTIMIZER": {
         "name": "AdamW",
-        "lr": 1e-4,               # 実行時は lr * world_size でスケーリング
+        "lr": 5e-5,               # 実行時は lr * world_size でスケーリング - 勾配爆発防止のため半減
         "weight_decay": 0.0,
         "betas": (0.9, 0.999),
         "eps": 1e-8,
@@ -133,13 +133,13 @@ CFG = {
     "LOSS": {
         "enable_intensity_weighted_loss": True,
 
-        # 1時間降水（mm/h）
+        # 1時間降水（mm/h）- 極端な重み（100倍）を避け、最大10倍に抑えて勾配爆発を防止
         "intensity_weight_bins_1h": [1.0, 5.0, 10.0, 20.0, 30.0, 50.0],
-        "intensity_weight_values_1h": [1.0, 1.1, 1.3, 2.2, 10.0, 25.0, 100.0],
+        "intensity_weight_values_1h": [1.0, 1.2, 1.5, 2.0, 3.0, 5.0, 10.0],
 
-        # 3時間積算（mm/3h）
+        # 3時間積算（mm/3h）- 同様に最大10倍に抑制
         "intensity_weight_bins_sum": [2.0, 10.0, 20.0, 40.0, 60.0, 100.0],
-        "intensity_weight_values_sum": [1.0, 1.1, 1.3, 2.2, 10.0, 25.0, 100.0],
+        "intensity_weight_values_sum": [1.0, 1.2, 1.5, 2.0, 3.0, 5.0, 10.0],
     },
 
     # 評価/可視化

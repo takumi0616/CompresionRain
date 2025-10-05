@@ -365,6 +365,7 @@ def custom_loss_function(output, targets, eps=1e-8):
 def train_one_epoch(rank, model, dataloader, optimizer, scaler, epoch, exec_log_path):
     model.train()
     total_loss, total_1h_rmse, total_sum_rmse = 0.0, 0.0, 0.0
+    skipped_batches = 0
     dataloader.sampler.set_epoch(epoch)
     
     with open(exec_log_path, 'a', encoding='utf-8') as log_file:
@@ -373,23 +374,39 @@ def train_one_epoch(rank, model, dataloader, optimizer, scaler, epoch, exec_log_
             leave=True, file=log_file,
             bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
         )
-        for batch in progress_bar:
+        for batch_idx, batch in enumerate(progress_bar):
             inputs = batch['input'].to(rank, non_blocking=True)
             targets = {k: v.to(rank, non_blocking=True) for k, v in batch.items() if k != 'input'}
             optimizer.zero_grad(set_to_none=True)
+            
+            # 入力データの健全性チェック（初期エポックのみ）
+            if epoch == 0 and batch_idx == 0 and rank == 0:
+                progress_bar.write(f"[DEBUG] Input range: [{inputs.min().item():.4f}, {inputs.max().item():.4f}]")
+                progress_bar.write(f"[DEBUG] Target_1h range: [{targets['target_1h'].min().item():.4f}, {targets['target_1h'].max().item():.4f}]")
+                progress_bar.write(f"[DEBUG] Target_sum range: [{targets['target_sum'].min().item():.4f}, {targets['target_sum'].max().item():.4f}]")
+            
             with autocast(device_type='cuda', dtype=AMP_TORCH_DTYPE):
                 outputs = model(inputs)
                 loss, loss_1h, loss_sum = custom_loss_function(outputs, targets)
+            
             # 非有限値の検出とスキップ（DDP安定のためゼログラドしてcontinue）
             if not torch.isfinite(loss):
+                skipped_batches += 1
                 if rank == 0:
-                    progress_bar.write(f"Warning: non-finite loss detected. Skipping batch. loss={loss.item()}")
+                    progress_bar.write(f"Warning: non-finite loss detected at batch {batch_idx}. loss={loss.item()}, rmse_1h={loss_1h.item()}, rmse_sum={loss_sum.item()}")
+                    progress_bar.write(f"Output range: [{outputs.min().item():.4f}, {outputs.max().item():.4f}]")
                 optimizer.zero_grad(set_to_none=True)
                 continue
+            
             scaler.scale(loss).backward()
             # AMP下の勾配を一度unscaleしてからクリッピング（NaN/Inf対策）
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # 勾配の健全性チェック（初期エポックのみ）
+            if epoch == 0 and batch_idx == 0 and rank == 0:
+                progress_bar.write(f"[DEBUG] Gradient norm before clipping: {grad_norm:.6f}")
+            
             scaler.step(optimizer)
             scaler.update()
             total_loss += loss.item()
@@ -397,6 +414,9 @@ def train_one_epoch(rank, model, dataloader, optimizer, scaler, epoch, exec_log_
             total_sum_rmse += loss_sum.item()
             if rank == 0:
                 progress_bar.set_postfix(loss=loss.item(), rmse_1h=loss_1h.item(), rmse_sum=loss_sum.item())
+        
+        if rank == 0 and skipped_batches > 0:
+            progress_bar.write(f"[WARNING] Epoch {epoch+1}: Skipped {skipped_batches} batches due to non-finite loss")
             
     avg_loss = torch.tensor([total_loss, total_1h_rmse, total_sum_rmse], device=rank) / len(dataloader)
     dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
@@ -472,10 +492,11 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
 
             # 追加: 詳細メトリクスのためのデータ
             outputs = torch.relu(outputs)
-            pred_1h = outputs.detach().cpu().numpy()       # (B,3,H,W)
-            true_1h = targets['target_1h'].detach().cpu().numpy()
-            pred_sum = outputs.sum(dim=1, keepdim=True).detach().cpu().numpy()  # (B,1,H,W)
-            true_sum = targets['target_sum'].detach().cpu().numpy()
+            # bf16対応: numpy変換前にfloat32へ変換
+            pred_1h = outputs.detach().float().cpu().numpy()       # (B,3,H,W)
+            true_1h = targets['target_1h'].detach().float().cpu().numpy()
+            pred_sum = outputs.sum(dim=1, keepdim=True).detach().float().cpu().numpy()  # (B,1,H,W)
+            true_sum = targets['target_sum'].detach().float().cpu().numpy()
             B, _, H, W = outputs.shape
 
             # バイナリ（時刻別・積算）
@@ -930,10 +951,11 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
             outputs = model(inputs)
         outputs = torch.relu(outputs)
 
-        pred_1h = outputs.detach().cpu().numpy()
-        true_1h = targ_1h.detach().cpu().numpy()
-        pred_sum = outputs.sum(dim=1, keepdim=True).detach().cpu().numpy()
-        true_sum = targ_sum.detach().cpu().numpy()
+        # bf16対応: numpy変換前にfloat32へ変換
+        pred_1h = outputs.detach().float().cpu().numpy()
+        true_1h = targ_1h.detach().float().cpu().numpy()
+        pred_sum = outputs.sum(dim=1, keepdim=True).detach().float().cpu().numpy()
+        true_sum = targ_sum.detach().float().cpu().numpy()
         B, _, H, W = outputs.shape
 
         for thr in BINARY_THRESHOLDS_MM_1H:
