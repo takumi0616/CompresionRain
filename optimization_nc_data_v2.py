@@ -15,6 +15,8 @@ from pathlib import Path
 from tqdm import tqdm
 import concurrent.futures
 from dask.diagnostics import ProgressBar
+from dask.distributed import Client
+import gc
 
 # ==============================================================================
 # --- 基本設定 (このセクションを編集して実行) ---
@@ -25,7 +27,8 @@ END_YEAR = 2023
 
 # 並列処理ワーカー数 (マシンのCPUコア数に合わせて調整)
 # メモリ使用量とディスクI/Oを考慮し、CPUコア数より少し少なめに設定するのも良い
-MAX_WORKERS = 16
+# 単一ファイル内並列に使用するスレッド数（CPUコア数）
+MAX_WORKERS = 40
 
 # --- パス設定 ---
 # このスクリプトが存在するディレクトリを基準にパスを構築
@@ -291,6 +294,10 @@ def main():
     logging.info(f"Input directory: {INPUT_DIR}")
     logging.info(f"Output directory: {OUTPUT_DIR}")
     logging.info(f"Scaler file: {SCALER_FILE}")
+    # 数値演算ライブラリのスレッド数を制御（可能なら）
+    os.environ.setdefault("OMP_NUM_THREADS", str(MAX_WORKERS))
+    os.environ.setdefault("MKL_NUM_THREADS", str(MAX_WORKERS))
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", str(MAX_WORKERS))
 
     file_paths = sorted([p for p in INPUT_DIR.glob("*.nc")])
     if not file_paths:
@@ -340,29 +347,35 @@ def main():
     except Exception as e:
         logging.warning(f"Failed to write scaler grouping meta: {e}")
 
-    logging.info(f"\n--- Starting parallel optimization of {len(file_paths)} monthly files using {MAX_WORKERS} workers ---")
+    logging.info(f"\n--- Starting per-file optimization (sequential over files, parallel within file using {MAX_WORKERS} threads) ---")
 
     process_start_time = time.time()
     with tqdm(total=len(file_paths), desc="Optimizing files", file=os.sys.stderr) as pbar:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [
-                executor.submit(
-                    optimize_monthly_netcdf,
+        for fp in file_paths:
+            # 各ファイル処理ごとにスレッド型Daskクライアントを作成（メモリ複製を避ける）
+            logging.info(f"[{fp.name}] Creating per-file Dask client (threads={MAX_WORKERS})")
+            client = Client(processes=False, n_workers=1, threads_per_worker=MAX_WORKERS)
+            try:
+                result = optimize_monthly_netcdf(
                     fp,
                     OUTPUT_DIR / fp.name,
                     str(SCALER_FILE),
                     var_to_group,
                     target_variables
-                ) for fp in file_paths
-            ]
-
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
+                )
                 logging.info(result)
                 pbar.update(1)
+            finally:
+                # このファイルの計算を確実に完了し、メモリを開放
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                del client
+                gc.collect()
 
     process_elapsed = time.time() - process_start_time
-    logging.info(f"--- Parallel optimization finished. Time taken: {datetime.timedelta(seconds=int(process_elapsed))} ---")
+    logging.info(f"--- Per-file optimization finished. Time taken: {datetime.timedelta(seconds=int(process_elapsed))} ---")
 
     total_elapsed = time.time() - total_start_time
     logging.info(f"\n===== All processes finished. Total execution time: {datetime.timedelta(seconds=int(total_elapsed))} =====")

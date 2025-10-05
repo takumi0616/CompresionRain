@@ -1,7 +1,13 @@
 ```bash
 notify-run gpu01 -- nohup python swinunet_main_v1.py > swinunet_main_v1.log 2>&1 &
 
+notify-run gpu02 -- nohup python optimization_nc_data.py > optimization_nc_data.log 2>&1 &
+
+notify-run gpu02 -- nohup python optimization_nc_data_v2.py > optimization_nc_data_v2.log 2>&1 &
+
 notify-run gpu01 -- nohup python optimization_nc_data.py > optimization_nc_data.log 2>&1 &
+
+notify-run gpu01 -- nohup python optimization_nc_data_v2.py > optimization_nc_data_v2.log 2>&1 &
 
 notify-run gpu01 -- nohup python3 check_data.py > check_data.log 2>&1 &
 
@@ -36,6 +42,8 @@ nohup python check_output_nc.py > check_output_nc.log 2>&1 &
 pkill -f "swinunet_main_v1.py"
 
 pkill -f "optimization_nc_data.py"
+
+pkill -f "optimization_nc_data_v2.py"
 
 pkill -f "convert_data_v1.py"
 

@@ -9,3 +9,4 @@ output_nc/
 *.png
 *.mp4
 result_*/
+/scaler_groups.json
