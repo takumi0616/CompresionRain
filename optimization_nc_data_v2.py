@@ -13,9 +13,8 @@ import hdf5plugin  # LZ4圧縮に必要
 import dask
 from pathlib import Path
 from tqdm import tqdm
-import concurrent.futures
 from dask.diagnostics import ProgressBar
-from dask.distributed import Client
+from multiprocessing.pool import ThreadPool
 import gc
 
 # ==============================================================================
@@ -29,6 +28,8 @@ END_YEAR = 2023
 # メモリ使用量とディスクI/Oを考慮し、CPUコア数より少し少なめに設定するのも良い
 # 単一ファイル内並列に使用するスレッド数（CPUコア数）
 MAX_WORKERS = 40
+# 出力時のtimeチャンクサイズ（I/O効率改善のため）
+WRITE_TIME_CHUNK = 24
 
 # --- パス設定 ---
 # このスクリプトが存在するディレクトリを基準にパスを構築
@@ -218,12 +219,15 @@ def optimize_monthly_netcdf(file_path, output_path, scaler_path, var_to_group, t
         # 各ワーカー内でスケーラを開く（プロセス間共有より軽量）
         scaler_ds = xr.open_dataset(scaler_path)
 
-        with xr.open_dataset(file_path, chunks={'time': 1}) as ds:
+        with xr.open_dataset(file_path, chunks='auto') as ds:
             # 時間特徴量は完全削除
             drop_vars = [v for v in TIME_FEATURE_VARS if v in ds]
             if drop_vars:
                 ds = ds.drop_vars(drop_vars)
                 logging.info(f"時間特徴を除去: {drop_vars}")
+
+            # 読み込みチャンクをtime方向に揃えて計算・I/O効率を改善
+            ds = ds.chunk({'time': min(WRITE_TIME_CHUNK, ds.sizes.get('time', 1))})
 
             # 正規化（x / scale）: グループの scale(lat,lon) を使用
             variables_to_norm = [v for v in target_variables if v in ds and v in var_to_group]
@@ -241,15 +245,23 @@ def optimize_monthly_netcdf(file_path, output_path, scaler_path, var_to_group, t
                     ds[var_name] = ds[var_name] / scale
                     pbar.update(1)
 
+            # スケーラをクローズしてメモリ・FDを解放
+            try:
+                scaler_ds.close()
+            except Exception:
+                pass
+
             # 圧縮設定
             encoding = {}
             for var in ds.data_vars:
                 # time 次元がある 3次元以上の変数にチャンクを設定
                 if ds[var].ndim >= 3 and 'time' in ds[var].dims:
                     # (time=1, lat, lon) チャンク
+                    time_len = int(ds.sizes.get('time', 1))
+                    time_chunk = min(WRITE_TIME_CHUNK, time_len)
                     encoding[var] = {
                         **hdf5plugin.LZ4(),
-                        'chunksizes': (1,) + ds[var].shape[1:]
+                        'chunksizes': (time_chunk,) + ds[var].shape[1:]
                     }
                 else:
                     # 2次元変数などはデフォルト圧縮のみにする
@@ -347,15 +359,14 @@ def main():
     except Exception as e:
         logging.warning(f"Failed to write scaler grouping meta: {e}")
 
-    logging.info(f"\n--- Starting per-file optimization (sequential over files, parallel within file using {MAX_WORKERS} threads) ---")
+    logging.info(f"\n--- Starting per-file optimization (sequential over files, parallel within file using {MAX_WORKERS} threads, local threads scheduler) ---")
 
     process_start_time = time.time()
     with tqdm(total=len(file_paths), desc="Optimizing files", file=os.sys.stderr) as pbar:
         for fp in file_paths:
-            # 各ファイル処理ごとにスレッド型Daskクライアントを作成（メモリ複製を避ける）
-            logging.info(f"[{fp.name}] Creating per-file Dask client (threads={MAX_WORKERS})")
-            client = Client(processes=False, n_workers=1, threads_per_worker=MAX_WORKERS)
-            try:
+            # ローカルthreadsスケジューラで1ファイル内並列（送信オーバーヘッドを回避）
+            logging.info(f"[{fp.name}] Using local threads scheduler (threads={MAX_WORKERS})")
+            with dask.config.set(scheduler='threads', pool=ThreadPool(MAX_WORKERS)):
                 result = optimize_monthly_netcdf(
                     fp,
                     OUTPUT_DIR / fp.name,
@@ -363,16 +374,9 @@ def main():
                     var_to_group,
                     target_variables
                 )
-                logging.info(result)
-                pbar.update(1)
-            finally:
-                # このファイルの計算を確実に完了し、メモリを開放
-                try:
-                    client.close()
-                except Exception:
-                    pass
-                del client
-                gc.collect()
+            logging.info(result)
+            pbar.update(1)
+            gc.collect()
 
     process_elapsed = time.time() - process_start_time
     logging.info(f"--- Per-file optimization finished. Time taken: {datetime.timedelta(seconds=int(process_elapsed))} ---")
