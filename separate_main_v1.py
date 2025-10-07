@@ -8,12 +8,19 @@
 # - モデル出力はlogits(3ch)。チャネル方向softmaxで比率化
 # - 損失は量のMSE（強度重み付き; v5の設定を踏襲）＋任意の比率KL（S>0のみ）
 # - 既存の評価/可視化系は維持（equal-splitとの比較など）。動画化は削除しシンプル化
+# - 数値安定化: TIME_VARS の NaN/Inf→0 補正、softmax 前の logits/tau の NaN/Inf 除去、softmax 出力の再正規化
 
 import os
 import glob
 import warnings
 import matplotlib.pyplot as plt
-import hdf5plugin  # noqa: F401  # register external HDF5 filters for h5netcdf
+# hdf5plugin は存在しない環境があるため任意依存にする
+try:
+    import hdf5plugin  # noqa: F401  # register external HDF5 filters for h5netcdf
+    HDF5PLUGIN_AVAILABLE = True
+except Exception as e:
+    HDF5PLUGIN_AVAILABLE = False
+    warnings.warn(f"hdf5plugin が見つからないため、NetCDFの一部圧縮フィルタが利用できない可能性があります: {e}")
 from matplotlib.colors import LogNorm
 import numpy as np
 import torch
@@ -31,11 +38,16 @@ import logging
 import sys
 import random
 from bisect import bisect_right
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-
-# 可視化可否フラグ
-CARTOPY_AVAILABLE = True
+# Cartopy は任意依存（無い環境では地図付き可視化をスキップ）
+try:
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    CARTOPY_AVAILABLE = True
+except Exception as e:
+    CARTOPY_AVAILABLE = False
+    ccrs = None
+    cfeature = None
+    warnings.warn(f"Cartopy が見つからないため、地図付き可視化をスキップします: {e}")
 
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
@@ -493,7 +505,14 @@ class NetCDFDataset(Dataset):
         # 時間特徴はスカラーを HxW に複製（RAM使用は小さい）
         h, w = self.img_dims
         for tvar in TIME_VARS:
-            val = float(sample[tvar].values.item())
+            raw_val = sample[tvar].values.item()
+            # 時間特徴の堅牢化: NaN/Inf/欠損は 0.0 に置換してチャネル化
+            try:
+                val = float(raw_val)
+            except Exception:
+                val = 0.0
+            if not np.isfinite(val):
+                val = 0.0
             channel = np.full((h, w), val, dtype=np.float32)
             input_channels.append(channel)
 
@@ -594,8 +613,14 @@ def custom_loss_function(output, targets):
     target_1h = targets['target_1h'].float()  # (B,3,H,W)
 
     # softmax -> 比率（微小値を下限clampしてから再正規化）
+    # softmax 前の数値安定化: logits/tau の NaN/Inf を除去
+    logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+    if tau_map is not None:
+        tau_map = torch.nan_to_num(tau_map, nan=1.0, posinf=1.0, neginf=1.0)
     logits_scaled = logits / tau_map if tau_map is not None else logits
     ratios = torch.softmax(logits_scaled, dim=1)                   # (B,3,H,W)
+    # softmax 後の数値安定化: NaN/Inf は一様比率で置換し、再正規化
+    ratios = torch.nan_to_num(ratios, nan=1.0/NUM_CLASSES, posinf=1.0/NUM_CLASSES, neginf=1.0/NUM_CLASSES)
     ratios = torch.clamp(ratios, min=eps)                          # avoid log(0)
     ratios = ratios / ratios.sum(dim=1, keepdim=True).clamp_min(eps)
 
@@ -677,13 +702,28 @@ def train_one_epoch(rank, model, dataloader, optimizer, scaler, epoch, exec_log_
             leave=True, file=log_file,
             bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
         )
-        for batch in progress_bar:
+        for batch_idx, batch in enumerate(progress_bar):
             inputs = batch['input'].to(rank, non_blocking=True)
             targets = {k: v.to(rank, non_blocking=True) for k, v in batch.items() if k != 'input'}
             optimizer.zero_grad(set_to_none=True)
+
+            # 初回バッチのデータ範囲をデバッグ出力（データ不具合の早期検知）
+            if epoch == 0 and batch_idx == 0 and rank == 0:
+                progress_bar.write(f"[DEBUG] Input range: [{inputs.min().item():.4f}, {inputs.max().item():.4f}]")
+                progress_bar.write(f"[DEBUG] Target_1h range: [{targets['target_1h'].min().item():.4f}, {targets['target_1h'].max().item():.4f}]")
+                progress_bar.write(f"[DEBUG] Target_sum range: [{targets['target_sum'].min().item():.4f}, {targets['target_sum'].max().item():.4f}]")
+
             with autocast(device_type='cuda', dtype=torch.float16):
                 outputs = model(inputs)
                 loss, loss_1h, loss_sum = custom_loss_function(outputs, targets)
+
+            # 非有限損失の検出とスキップ（数値暴走時の安定化）
+            if not torch.isfinite(loss):
+                if rank == 0:
+                    progress_bar.write(f"Warning: non-finite loss detected at batch {batch_idx}. loss={loss.item()}, rmse_1h={loss_1h.item()}, rmse_sum={loss_sum.item()}")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             scaler.scale(loss).backward()
             # 勾配クリッピング（数値安定化）
             scaler.unscale_(optimizer)
@@ -1674,18 +1714,21 @@ if __name__ == '__main__':
     
     main_logger, _ = setup_loggers()
 
-    main_logger.info("Cartopyの地図データを事前にダウンロードします...")
-    try:
-        # ダミーのプロットを作成して、COASTLINEとBORDERSのデータをダウンロードさせる
-        # これにより、並列プロセスが同時にダウンロードするのを防ぐ
-        fig_pre = plt.figure()
-        ax_pre = plt.axes(projection=ccrs.PlateCarree())
-        ax_pre.add_feature(cfeature.COASTLINE)
-        ax_pre.add_feature(cfeature.BORDERS)
-        plt.close(fig_pre)
-        main_logger.info("Cartopyのデータダウンロードが完了しました。")
-    except Exception as e:
-        main_logger.warning(f"Cartopyのデータ事前ダウンロード中にエラーが発生しました: {e}")
+    if CARTOPY_AVAILABLE:
+        main_logger.info("Cartopyの地図データを事前にダウンロードします...")
+        try:
+            # ダミーのプロットを作成して、COASTLINEとBORDERSのデータをダウンロードさせる
+            # これにより、並列プロセスが同時にダウンロードするのを防ぐ
+            fig_pre = plt.figure()
+            ax_pre = plt.axes(projection=ccrs.PlateCarree())
+            ax_pre.add_feature(cfeature.COASTLINE)
+            ax_pre.add_feature(cfeature.BORDERS)
+            plt.close(fig_pre)
+            main_logger.info("Cartopyのデータダウンロードが完了しました。")
+        except Exception as e:
+            main_logger.warning(f"Cartopyのデータ事前ダウンロード中にエラーが発生しました: {e}")
+    else:
+        main_logger.warning("Cartopyが利用できないため、地図データの事前ダウンロードと地図付き可視化をスキップします。")
 
     main_logger.info(f"データディレクトリ: {DATA_DIR}")
     main_logger.info(f"現在の作業ディレクトリ: {os.getcwd()}")
