@@ -1,3 +1,16 @@
+"""
+モジュール概要:
+    本ファイルは Swin Transformer をバックボーンにした U-Net 形状のエンコーダ・デコーダを実装する。
+    - 局所ウィンドウ注意 (WindowAttention) とシフトウィンドウ (SwinTransformerBlock) により大域的文脈を効率的に獲得。
+    - パッチダウンサンプリング (PatchMerging) とアップサンプリング (PatchExpand/FinalPatchExpand) で
+      U-Net 風のスキップ接続を構成し、空間分解能を往復する。
+    - 出力ヘッドはクラス数チャネルのロジットを返す。temperature_mode='dynamic'/'global' 時は温度マップも併せて返す。
+    - 本実装は separate_main_v1.py 内の比率モデルで使用され、チャネル方向 softmax 前の logits を生成する。
+
+依存:
+    - PyTorch, timm.layers (DropPath, to_2tuple, trunc_normal_), einops.rearrange
+"""
+
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
@@ -7,6 +20,20 @@ from einops import rearrange
 
 
 class Mlp(nn.Module):
+    """
+    概要:
+        2層の全結合 MLP。活性化と Dropout を間に挟む基本的なFFNブロック。
+    入力:
+        - in_features (int): 入力特徴次元。
+        - hidden_features (int|None): 中間層次元。未指定なら in_features。
+        - out_features (int|None): 出力次元。未指定なら in_features。
+        - act_layer (nn.Module): 活性化関数クラス。既定 GELU。
+        - drop (float): Dropout 率。
+    処理:
+        - x -> Linear(in, hidden) -> Act -> Dropout -> Linear(hidden, out) -> Dropout
+    出力:
+        - Tensor[..., out_features]: 同形状バッチに対する線形変換結果。
+    """
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
         out_features = out_features or in_features
@@ -26,6 +53,17 @@ class Mlp(nn.Module):
 
 
 def window_partition(x, window_size):
+    """
+    概要:
+        画像特徴 (B,H,W,C) を window_size×window_size のタイルへ分割する。
+    入力:
+        - x (Tensor): 形状 (B, H, W, C) の特徴マップ。
+        - window_size (int): ウィンドウ一辺のサイズ。
+    処理:
+        - (H//ws, ws, W//ws, ws) に整形し、連結して (B*nW, ws, ws, C) に並べ替え。
+    出力:
+        - Tensor: 形状 (B * nWindows, window_size, window_size, C)。
+    """
     B, H, W, C = x.shape
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
@@ -33,6 +71,18 @@ def window_partition(x, window_size):
 
 
 def window_reverse(windows, window_size, H, W):
+    """
+    概要:
+        window_partition で分割されたパッチ列を元の空間配置 (B,H,W,C) に復元する。
+    入力:
+        - windows (Tensor): (B*nWindows, window_size, window_size, C)
+        - window_size (int): ウィンドウ一辺のサイズ。
+        - H, W (int): 復元先の高さ・幅。
+    処理:
+        - ウィンドウを (H//ws, W//ws) グリッドに並べ直し、元の (B,H,W,C) に整形。
+    出力:
+        - Tensor: 形状 (B, H, W, C)。
+    """
     B = int(windows.shape[0] / (H * W / window_size / window_size))
     x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
@@ -40,6 +90,18 @@ def window_reverse(windows, window_size, H, W):
 
 
 class WindowAttention(nn.Module):
+    """
+    概要:
+        Swin Transformer における局所ウィンドウ内のマルチヘッド自己注意。
+        相対位置バイアスをもつ注意マップを計算し、（シフト）ウィンドウ境界のマスクにも対応。
+    入力(コンストラクタ):
+        - dim (int): 入出力埋め込み次元。
+        - window_size (Tuple[int,int]): ウィンドウの高さ・幅。
+        - num_heads (int): 注意ヘッド数。
+        - qkv_bias, qk_scale, attn_drop, proj_drop: QKVバイアス、スケール、ドロップ率設定。
+    出力:
+        なし（forward 参照）
+    """
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
         super().__init__()
         self.dim = dim
@@ -72,6 +134,19 @@ class WindowAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x, mask=None):
+        """
+        概要:
+            ウィンドウ内トークン列 x に対し、相対位置バイアス付き自己注意を適用する。
+        入力:
+            - x (Tensor): 形状 (B*nW, N, C)。N=window_size*window_size。
+            - mask (Tensor|None): シフトウィンドウによる境界マスク（nW,N,N）。
+        処理:
+            - Q,K,V を線形射影しスケーリング。
+            - 相対位置バイアスとマスクを加味し softmax（数値安定のためfloat32で計算）。
+            - 注意出力を線形射影で元次元に復帰。
+        出力:
+            - Tensor: 形状 (B*nW, N, C) のウィンドウ内注意出力。
+        """
         B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
@@ -116,6 +191,19 @@ class WindowAttention(nn.Module):
 
 
 class SwinTransformerBlock(nn.Module):
+    """
+    概要:
+        Swin Transformer の基本ブロック。ウィンドウ注意（シフト有無を交互）＋ MLP から構成。
+    入力(コンストラクタ):
+        - dim (int): 埋め込み次元。
+        - input_resolution (Tuple[int,int]): 入力のパッチグリッド解像度 (H,W)。
+        - num_heads (int): 注意ヘッド数。
+        - window_size (int): ウィンドウサイズ。
+        - shift_size (int): シフト量（偶奇で0/半分を切替）。
+        - その他: MLP比率、drop率等。
+    出力:
+        なし（forward 参照）
+    """
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm):
@@ -166,6 +254,17 @@ class SwinTransformerBlock(nn.Module):
         self.register_buffer("attn_mask", attn_mask)
 
     def forward(self, x):
+        """
+        概要:
+            入力シーケンスに対して、（シフト）ウィンドウ注意とMLPを適用し、残差接続で出力する。
+        入力:
+            - x (Tensor): 形状 (B, H*W, C)。H*W は input_resolution に一致。
+        処理:
+            - LayerNorm -> ウィンドウ分割 -> 注意 -> 逆変換 -> 残差
+            - LayerNorm -> MLP -> 残差
+        出力:
+            - Tensor: 形状 (B, H*W, C)。
+        """
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W
@@ -214,6 +313,15 @@ class SwinTransformerBlock(nn.Module):
 
 
 class PatchMerging(nn.Module):
+    """
+    概要:
+        2×2 パッチを結合して解像度を /2 にし、チャネルを2倍にするダウンサンプリング（ステージ間遷移）。
+    入力(コンストラクタ):
+        - input_resolution (Tuple[int,int]): 入力パッチグリッド解像度。
+        - dim (int): 入力埋め込み次元。
+    出力:
+        なし（forward 参照）
+    """
     def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm):
         super().__init__()
         self.input_resolution = input_resolution
@@ -222,6 +330,16 @@ class PatchMerging(nn.Module):
         self.norm = norm_layer(4 * dim)
 
     def forward(self, x):
+        """
+        概要:
+            (B, H*W, C) を (B, (H/2)*(W/2), 2C) に縮約する。
+        入力:
+            - x (Tensor): 形状 (B, H*W, C)。
+        処理:
+            - 2×2 ごとに4枚を結合し、LayerNorm -> 線形射影で 2C へ。
+        出力:
+            - Tensor: (B, (H/2)*(W/2), 2C)
+        """
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W
@@ -252,6 +370,16 @@ class PatchMerging(nn.Module):
 
 
 class PatchExpand(nn.Module):
+    """
+    概要:
+        パッチ次元を展開して空間解像度を ×2 に上げるアップサンプリング。
+    入力(コンストラクタ):
+        - input_resolution (Tuple[int,int]): 入力パッチグリッド解像度。
+        - dim (int): 入力埋め込み次元。
+        - dim_scale (int): アップスケール係数（通常2）。
+    出力:
+        なし（forward 参照）
+    """
     def __init__(self, input_resolution, dim, dim_scale=2, norm_layer=nn.LayerNorm):
         super().__init__()
         self.input_resolution = input_resolution
@@ -260,6 +388,16 @@ class PatchExpand(nn.Module):
         self.norm = norm_layer(dim // dim_scale)
 
     def forward(self, x):
+        """
+        概要:
+            (B, H*W, C) を (B, (2H)*(2W), C/4) に再配置して解像度を2倍にする。
+        入力:
+            - x (Tensor): 形状 (B, H*W, C)。
+        処理:
+            - 線形で2Cに拡張後、(2,2) pixel-shuffle 相当の再配置 -> LayerNorm。
+        出力:
+            - Tensor: (B, 4*H*W, C/4)
+        """
         H, W = self.input_resolution
         x = self.expand(x)
         B, L, C = x.shape
@@ -274,6 +412,16 @@ class PatchExpand(nn.Module):
 
 
 class FinalPatchExpand(nn.Module):
+    """
+    概要:
+        最後のアップサンプリング。dim_scale 倍の pixel-shuffle 相当で元の画像解像度へ復帰。
+    入力(コンストラクタ):
+        - input_resolution (Tuple[int,int]): 入力パッチ解像度。
+        - dim (int): 入力埋め込み次元。
+        - dim_scale (int): 画像パッチサイズ（例:4）。
+    出力:
+        なし（forward 参照）
+    """
     def __init__(self, input_resolution, dim, dim_scale, norm_layer=nn.LayerNorm):
         super().__init__()
         self.input_resolution = input_resolution
@@ -284,6 +432,16 @@ class FinalPatchExpand(nn.Module):
         self.norm = norm_layer(self.output_dim)
 
     def forward(self, x):
+        """
+        概要:
+            (B, H*W, C) -> (B, (H*ps)*(W*ps), C) に展開して出力解像度へ復帰する。
+        入力:
+            - x (Tensor): 形状 (B, H*W, C)。
+        処理:
+            - 線形で (ps*ps*C) に拡張し、(ps,ps) の再配置で空間解像度を ps 倍に。
+        出力:
+            - Tensor: (B, (psH)*(psW), C)
+        """
         H, W = self.input_resolution
         x = self.expand(x)
         B, L, C = x.shape
@@ -297,6 +455,15 @@ class FinalPatchExpand(nn.Module):
 
 
 class BasicLayer(nn.Module):
+    """
+    概要:
+        複数の SwinTransformerBlock を順次適用し、必要に応じて PatchMerging によりダウンサンプリングする層。
+    入力(コンストラクタ):
+        - dim, input_resolution, depth, num_heads, window_size など各種設定。
+        - downsample: PatchMerging を指定すると段の末尾で解像度を半分に。
+    出力:
+        なし（forward 参照）
+    """
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
@@ -323,6 +490,14 @@ class BasicLayer(nn.Module):
             self.downsample = None
 
     def forward(self, x):
+        """
+        概要:
+            depth 回 SwinTransformerBlock を適用し、必要ならダウンサンプリングする。
+        入力:
+            - x (Tensor): (B, H*W, C)
+        出力:
+            - Tensor: 次段入力（ダウンサンプリング有なら (B,(H/2)*(W/2),2C)）
+        """
         for blk in self.blocks:
             if self.use_checkpoint:
                 x = checkpoint.checkpoint(blk, x)
@@ -345,6 +520,15 @@ class BasicLayer(nn.Module):
 
 
 class BasicLayer_up(nn.Module):
+    """
+    概要:
+        複数の SwinTransformerBlock を適用し、必要に応じて PatchExpand によりアップサンプリングする層。
+    入力(コンストラクタ):
+        - dim, input_resolution, depth, num_heads, window_size など各種設定。
+        - upsample: True の場合は段の末尾で ×2 アップサンプリング。
+    出力:
+        なし（forward 参照）
+    """
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., norm_layer=nn.LayerNorm, upsample=None, use_checkpoint=False):
@@ -371,6 +555,14 @@ class BasicLayer_up(nn.Module):
             self.upsample = None
 
     def forward(self, x):
+        """
+        概要:
+            depth 回 SwinTransformerBlock を適用し、必要ならアップサンプリングする。
+        入力:
+            - x (Tensor): (B, H*W, C)
+        出力:
+            - Tensor: 次段入力（アップサンプリング有なら (B,(2H)*(2W),C/4)）
+        """
         for blk in self.blocks:
             if self.use_checkpoint:
                 x = checkpoint.checkpoint(blk, x)
@@ -382,6 +574,17 @@ class BasicLayer_up(nn.Module):
 
 
 class PatchEmbed(nn.Module):
+    """
+    概要:
+        画像をパッチ単位に分割し、Conv(stride=patch) によりトークン列 (B, N, C) に埋め込む。
+    入力(コンストラクタ):
+        - img_size (int|Tuple): 入力画像サイズ。
+        - patch_size (int|Tuple): パッチサイズ。
+        - in_chans (int): 入力チャネル数。
+        - embed_dim (int): 出力埋め込み次元。
+    出力:
+        なし（forward 参照）
+    """
     def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
         super().__init__()
         img_size = to_2tuple(img_size)
@@ -402,6 +605,14 @@ class PatchEmbed(nn.Module):
             self.norm = None
 
     def forward(self, x):
+        """
+        概要:
+            (B,C,H,W) 画像をパッチ化し、(B, N, C_embed) のトークン列に変換する。
+        入力:
+            - x (Tensor): 形状 (B, in_chans, H, W)。H,W は img_size と一致。
+        出力:
+            - Tensor: (B, N, embed_dim), N=(H/ps)*(W/ps)
+        """
         B, C, H, W = x.shape
         assert H == self.img_size[0] and W == self.img_size[1]
         x = self.proj(x).flatten(2).transpose(1, 2)
@@ -418,6 +629,18 @@ class PatchEmbed(nn.Module):
 
 
 class SwinTransformerSys(nn.Module):
+    """
+    概要:
+        Swin Transformer Encoder-Decoder (U-Net 風) 全体モデル。
+        - エンコーダ: 多段の BasicLayer（PatchMerging で解像度を縮小）
+        - デコーダ: 多段の BasicLayer_up（PatchExpand で解像度を拡大、スキップ結合）
+        - 出力: 最終アップ後に 1×1 Conv で num_classes チャネルのロジットを生成。
+        - 温度スケーリング: temperature_mode='none'|'global'|'dynamic' により softmax 温度を推定・返却。
+    入力(コンストラクタ):
+        - img_size, patch_size, in_chans, num_classes ほか各種ハイパーパラメータ。
+    出力:
+        なし（forward 系メソッド参照）
+    """
     def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=1000,
                  embed_dim=96, depths=[2, 2, 2, 2], depths_decoder=[1, 2, 2, 2], num_heads=[3, 6, 12, 24],
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
@@ -549,6 +772,18 @@ class SwinTransformerSys(nn.Module):
         return {'relative_position_bias_table'}
 
     def forward_features(self, x):
+        """
+        概要:
+            画像をパッチ埋め込み後、各ステージのエンコーダ層を通して特徴を抽出する。
+        入力:
+            - x (Tensor): (B, in_chans, H, W)
+        処理:
+            - PatchEmbed -> 各 BasicLayer を通過し、各段の入力をスキップ用に保存。
+        出力:
+            - Tuple[Tensor, List[Tensor]]:
+                - x: 最終ステージ出力 (B, (H/ps^L)*(W/ps^L), C_L)
+                - x_downsample: 各段のスキップ特徴（上流から順）
+        """
         x = self.patch_embed(x)
         if self.ape:
             x = x + self.absolute_pos_embed
@@ -563,6 +798,15 @@ class SwinTransformerSys(nn.Module):
         return x, x_downsample
 
     def forward_up_features(self, x, x_downsample):
+        """
+        概要:
+            デコーダ側でアップサンプリングとスキップ結合を行い、空間解像度を段階的に復帰する。
+        入力:
+            - x (Tensor): エンコーダ最終出力。
+            - x_downsample (List[Tensor]): 各段のスキップ特徴。
+        出力:
+            - Tensor: デコーダ最終特徴 (B, H*W, embed_dim)
+        """
         for inx, layer_up in enumerate(self.layers_up):
             if inx == 0:
                 x = layer_up(x)
@@ -575,6 +819,21 @@ class SwinTransformerSys(nn.Module):
         return x
 
     def up_x(self, x):
+        """
+        概要:
+            最終アップサンプルと出力ヘッドを適用し、logits（および温度マップ）を生成する。
+        入力:
+            - x (Tensor): (B, H*W, C) デコーダ最終特徴。
+        処理:
+            - FinalPatchExpand で画像解像度へ整形し、Conv1x1 で num_classes に投影。
+            - temperature_mode に応じて温度 τ を推定:
+                - 'dynamic': 空間的に変化する τ マップ (B,1,H,W)
+                - 'global': スカラー τ を (B,1,H,W) にブロードキャスト
+                - 'none' : 温度は返さない
+        出力:
+            - temperature_mode=='none' : Tensor logits (B,num_classes,H,W)
+            - その他                 : Tuple(logits, tau_map)
+        """
         H, W = self.patches_resolution
         B, L, C = x.shape
         assert L == H * W
@@ -602,6 +861,15 @@ class SwinTransformerSys(nn.Module):
             return logits, tau_map
 
     def forward(self, x):
+        """
+        概要:
+            モデルの推論経路。エンコーダ→デコーダ→出力ヘッドの順に適用する。
+        入力:
+            - x (Tensor): (B, in_chans, H, W)
+        出力:
+            - temperature_mode=='none' : Tensor logits (B,num_classes,H,W)
+            - その他                 : Tuple(logits, tau_map)
+        """
         x, x_downsample = self.forward_features(x)
         x = self.forward_up_features(x, x_downsample)
         x = self.up_x(x)

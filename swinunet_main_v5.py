@@ -48,6 +48,8 @@ from tqdm import tqdm
 import logging
 import sys
 import random
+import json
+from pathlib import Path
 from bisect import bisect_right
 # 任意依存関係（存在しない場合は機能をスキップ）
 try:
@@ -84,6 +86,80 @@ os.environ['HDF5_DISABLE_VERSION_CHECK'] = '1'
 AMP_TORCH_DTYPE = torch.float16 if AMP_DTYPE == 'fp16' else torch.bfloat16
 
 # ==============================================================================
+# Min-Max 逆変換ユーティリティ（scaler_groups.json を使用）
+# ==============================================================================
+SCALER_JSON_PATH = os.path.join(os.path.dirname(__file__), "scaler_groups.json")
+ENFORCE_SUM_CONSISTENCY = True  # 逆変換後に3時間積算（和）が一致するようにスケーリングを適用する
+
+_group_minmax_cache = None
+def load_group_minmax(path: str = SCALER_JSON_PATH):
+    """
+    概要:
+        scaler_groups.json からグループ単位の min/max（グローバルスカラー）を読み込み、プロセス内でキャッシュする。
+    引数:
+        path (str): メタ情報JSONファイル（scaler_groups.json）のパス。
+    処理:
+        - 既に読み込み済みの場合はキャッシュを返す。
+        - JSON を読み込み、'group_minmax' キーの辞書を取り出す（なければ空辞書）。
+    戻り値:
+        Dict[str, Dict[str, float]]:
+            例: {"precip": {"min": 0.0, "max": 120.5}, ...}
+    """
+    global _group_minmax_cache
+    if _group_minmax_cache is not None:
+        return _group_minmax_cache
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+        _group_minmax_cache = meta.get('group_minmax', {}) or {}
+    except Exception:
+        _group_minmax_cache = {}
+    return _group_minmax_cache
+
+def inverse_precip_tensor(t: torch.Tensor, group_minmax: dict) -> torch.Tensor:
+    """
+    概要:
+        降水グループ 'precip' に対して min-max 正規化の逆変換を適用し、mm 単位へ復元する。
+    引数:
+        t (torch.Tensor): 任意shape（..., H, W）。チャネル数は 1ch または 3ch を想定。
+        group_minmax (dict): group_minmax の辞書（load_group_minmax の戻り値）。
+    処理:
+        - group_minmax['precip'] の min/max を取得し、x = t * (max - min) + min を適用。
+        - スケーラが存在しない場合は入力をそのまま返す。
+    戻り値:
+        torch.Tensor: 入力と同形状の mm スケールテンソル。
+    """
+    if not isinstance(t, torch.Tensor):
+        return t
+    gm = group_minmax.get('precip')
+    if not gm:
+        return t  # スケーラが無い場合はそのまま
+    gmin = float(gm.get('min', 0.0))
+    gmax = float(gm.get('max', 1.0))
+    scale = (gmax - gmin)
+    if scale <= 1e-12:
+        scale = 1.0
+    return t * scale + gmin
+
+def enforce_sum_constraint_tensor(pred_1h_mm: torch.Tensor, true_sum_mm: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    概要:
+        予測1時間値（B,3,H,W）のチャネル和が、与えられた3時間積算（B,1,H,W）に各画素ごと一致するよう一様スケール係数で補正する。
+    引数:
+        pred_1h_mm (Tensor): 予測1時間値（mm）。
+        true_sum_mm (Tensor): 既知の3時間積算（mm）。
+        eps (float): 0除算回避の微小値。
+    処理:
+        - denom = Σ_t pred_1h_mm を計算し、factor = true_sum_mm / clamp_min(denom, eps) を求める。
+        - pred_1h_mm * factor を返す。
+    戻り値:
+        Tensor: 補正後の 1h 予測（mm, B×3×H×W）。
+    """
+    denom = pred_1h_mm.sum(dim=1, keepdim=True).clamp_min(eps)
+    factor = true_sum_mm / denom
+    return pred_1h_mm * factor
+
+# ==============================================================================
 # 1. 設定 & ハイパーパラメータ
 # ==============================================================================
 
@@ -94,6 +170,17 @@ RANDOM_SEED = SEED
 # 1.5. 再現性確保のための関数
 # ==============================================================================
 def set_seed(seed):
+    """
+    概要:
+        乱数シードを固定して再現性を確保する。
+    引数:
+        seed (int): 固定するシード値。
+    処理:
+        - Python, NumPy, PyTorch(CPU/GPU) の乱数状態を初期化。
+        - cuDNN の deterministic/banchmark を適切に設定。
+    戻り値:
+        なし
+    """
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
@@ -105,6 +192,19 @@ def set_seed(seed):
 
 
 def get_monthly_files(data_dir, years, logger=None):
+    """
+    概要:
+        指定年の NetCDF 月次ファイル（{year}*.nc）を data_dir から収集する。
+    引数:
+        data_dir (str): 入力ディレクトリパス。
+        years (List[int]): 対象年のリスト。
+        logger (logging.Logger|None): ロガー（None のときは print）。
+    処理:
+        - 各年についてパターン検索し、昇順ソートして全一覧に追加。
+        - 見つからない年は警告、見つかった年は件数を出力。
+    戻り値:
+        List[str]: 見つかったファイルのパス（ソート済み）。
+    """
     files = []
     log_func = logger.info if logger else print
     for year in years:
@@ -121,6 +221,17 @@ def get_monthly_files(data_dir, years, logger=None):
 # 2. ロギング設定関数
 # ==============================================================================
 def setup_loggers():
+    """
+    概要:
+        ログ出力（ファイル＋標準出力）を初期化し、実行ログ・評価ログのヘッダを書き出す。
+    引数:
+        なし
+    処理:
+        - main ロガーを INFO レベルで作成し、FileHandler と StreamHandler を設定。
+        - EXEC_LOG_PATH/EVALUATION_LOG_PATH に初期メッセージを書き込む。
+    戻り値:
+        Tuple[logging.Logger, str]: (main_logger, EXEC_LOG_PATH)
+    """
     main_logger = logging.getLogger('main')
     main_logger.setLevel(logging.INFO)
     if main_logger.hasHandlers():
@@ -147,11 +258,30 @@ def setup_loggers():
 # 3. DDPセットアップ / クリーンアップ関数
 # ==============================================================================
 def setup_ddp(rank, world_size):
+    """
+    概要:
+        単一ノード想定で NCCL バックエンドにより DDP を初期化する。
+    引数:
+        rank (int): このプロセスの GPU ランク。
+        world_size (int): 総プロセス（GPU）数。
+    処理:
+        - MASTER_ADDR/MASTER_PORT を設定し、init_process_group を呼び出す。
+    戻り値:
+        なし
+    """
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
 def cleanup_ddp():
+    """
+    概要:
+        DDP のプロセスグループを安全に破棄する。
+    引数:
+        なし
+    戻り値:
+        なし
+    """
     dist.destroy_process_group()
 
 # ==============================================================================
@@ -294,10 +424,17 @@ class NetCDFDataset(Dataset):
 
 def _get_weight_map_from_bins(target_tensor, bin_edges, weight_values):
     """
-    target_tensor: 任意shapeのtorch.Tensor（mm）
-    bin_edges: 境界（例: [1,5,10,20,30,50]）
-    weight_values: 各ビンの重み（len = len(bin_edges)+1）
-    戻り: target_tensorと同shapeの重みテンソル
+    概要:
+        連続値（mm）をビン境界で区分し、各画素に対応する重みを返す。
+    引数:
+        target_tensor (Tensor): 任意shapeの mm 値テンソル。
+        bin_edges (List[float]): 右開区間のビン境界（例: [1,5,10,20,30,50]）。
+        weight_values (List[float]): 各ビンの重み（len = len(bin_edges)+1）。
+    処理:
+        - torch.bucketize でビンIDを求め、weight_values から該当重みを選択。
+        - 数値安定性のため float32 で計算。
+    戻り値:
+        Tensor: target_tensor と同shapeの重みテンソル（float32）。
     """
     # 数値安定化のため、ビニングと重み計算は常に float32 で実施（AMP下のhalfでのオーバーフロー回避）
     device = target_tensor.device
@@ -310,8 +447,21 @@ def _get_weight_map_from_bins(target_tensor, bin_edges, weight_values):
 
 def _weighted_mse(pred, target, bin_edges, weight_values, eps=1e-8):
     """
-    加重MSE: sum(w * (pred-target)^2) / sum(w)
-    注意: AMP(fp16/bf16) 下でもオーバーフローしないよう、計算は float32 で実施
+    概要:
+        重みマップに基づく加重MSEを計算する。
+    引数:
+        pred (Tensor): 予測テンソル。
+        target (Tensor): 正解テンソル（mm）。
+        bin_edges (List[float]): ビン境界。
+        weight_values (List[float]): 各ビン重み。
+        eps (float): 0除算回避の微小値。
+    処理:
+        - _get_weight_map_from_bins で weights を作成（float32）。
+        - num = Σ weights * (pred-target)^2、den = Σ weights + eps を計算し num/den を返す。
+    戻り値:
+        Tensor: スカラー損失（float32）。
+    注意:
+        AMP(fp16/bf16) 下でも安定するよう、計算は float32 に揃える。
     """
     pred_f = pred.float()
     target_f = target.float()
@@ -323,11 +473,20 @@ def _weighted_mse(pred, target, bin_edges, weight_values, eps=1e-8):
 
 def custom_loss_function(output, targets, eps=1e-8):
     """
-    v5: 1hは強度重み付きMSE、sumも2倍スケールのビン＋整数重みで強度重み付きMSEを適用。
-        （ログ用RMSEは従来通り、非加重MSEから算出）
-    数値安定化:
-      - モデル出力/ターゲットは float32 で計算（AMP下のhalfの和でInf→NaNを防止）
-      - RMSEのsqrtは負値を避けるためにclamp
+    概要:
+        v5 損失。1h（3ch）は強度重み付きMSE、sum（3h積算）も2倍スケールのビン＋重みで強度重み付きMSE。
+        ログ用の RMSE は非加重MSEから算出。
+    引数:
+        output (Tensor): モデル出力（B,3,H,W）非負想定（ReLUで整形）。
+        targets (Dict[str, Tensor]): {'target_1h':(B,3,H,W), 'target_sum':(B,1,H,W)}。
+        eps (float): RMSE 計算の数値安定用微小値。
+    処理:
+        - 出力/ターゲットの NaN/Inf を除去し、極端値をクリップ。
+        - predicted_sum = Σ output、未加重MSE を計算。
+        - ENABLE_INTENSITY_WEIGHTED_LOSS に応じて、_weighted_mse を1h/sumに適用。
+        - total_loss, rmse_1h, rmse_sum を返す。
+    戻り値:
+        Tuple[Tensor, Tensor, Tensor]: (total_loss, rmse_1h, rmse_sum)
     """
     # 物理量制約: 負の降水は0に、NaN/Infは安全値に置換
     output = torch.nan_to_num(output, nan=0.0, posinf=1e6, neginf=0.0)
@@ -363,6 +522,25 @@ def custom_loss_function(output, targets, eps=1e-8):
     return total_loss, rmse_1h, rmse_sum
 
 def train_one_epoch(rank, model, dataloader, optimizer, scaler, epoch, exec_log_path):
+    """
+    概要:
+        1エポック分の学習を実行し、DDP 全プロセスで平均化した損失/指標を返す。
+    引数:
+        rank (int): GPU ランク。
+        model (DDP Module): 学習対象モデル（DDP 包装済み）。
+        dataloader (DataLoader): 学習データローダ（DistributedSampler 必須）。
+        optimizer (Optimizer): 最適化器（AdamW 等）。
+        scaler (GradScaler): AMP 用スケーラ（bf16 時は disabled 可）。
+        epoch (int): エポック番号（0始まり）。
+        exec_log_path (str): tqdm の出力ファイルパス。
+    処理:
+        - autocast(AMP) で forward、custom_loss_function で損失算出。
+        - 非有限損失はスキップ。勾配クリップ後に optimizer step / scaler update。
+        - 進捗は rank0 のみファイルに表示。
+        - all_reduce(Average) で [total, 1h_rmse, sum_rmse] を集計。
+    戻り値:
+        np.ndarray: [avg_total_loss, avg_1h_rmse, avg_sum_rmse]
+    """
     model.train()
     total_loss, total_1h_rmse, total_sum_rmse = 0.0, 0.0, 0.0
     skipped_batches = 0
@@ -440,10 +618,20 @@ def _digitize_bins(x, bins):
 @torch.no_grad()
 def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
     """
-    1エポック分の検証処理 + 全評価指標の集計（DDPでall_reduceして集計）
+    概要:
+        1エポック分の検証を実行し、加重損失・1h/sum RMSE に加え、閾値別 Binary 指標やカテゴリ指標などを集計する。
+    引数:
+        rank (int): GPU ランク。
+        model (DDP Module): 評価対象モデル。
+        dataloader (DataLoader): 検証データローダ。
+        epoch (int): エポック番号。
+        exec_log_path (str): tqdm の出力ファイルパス。
+    処理:
+        - autocast(AMP) で forward、custom_loss_function で損失算出。
+        - min-max 逆変換＋和一致補正を適用した mm スケールで詳細メトリクスを算出。
+        - DDP all_reduce(SUM/Average) で集計し、rank0 で指標辞書を構築。
     戻り値:
-      - avg_losses: np.array([total_loss, rmse_1h, rmse_sum])
-      - epoch_metrics: dict (rank==0のみ有効、他rankはNone)
+        Tuple[np.ndarray, Optional[Dict]]: (avg_losses, epoch_metrics or None)
     """
     model.eval()
     total_loss, total_1h_rmse, total_sum_rmse = 0.0, 0.0, 0.0
@@ -490,13 +678,20 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
             total_1h_rmse += loss_1h.item()
             total_sum_rmse += loss_sum.item()
 
-            # 追加: 詳細メトリクスのためのデータ
+            # 追加: 詳細メトリクスのためのデータ（min-max逆変換＋積算一致の補正を適用）
             outputs = torch.relu(outputs)
-            # bf16対応: numpy変換前にfloat32へ変換
-            pred_1h = outputs.detach().float().cpu().numpy()       # (B,3,H,W)
-            true_1h = targets['target_1h'].detach().float().cpu().numpy()
-            pred_sum = outputs.sum(dim=1, keepdim=True).detach().float().cpu().numpy()  # (B,1,H,W)
-            true_sum = targets['target_sum'].detach().float().cpu().numpy()
+            gm = load_group_minmax()
+            pred_1h_mm_t = inverse_precip_tensor(outputs.float(), gm)                             # (B,3,H,W) in mm
+            true_1h_mm_t = inverse_precip_tensor(targets['target_1h'].float(), gm)               # (B,3,H,W) in mm
+            true_sum_mm_t = inverse_precip_tensor(targets['target_sum'].float(), gm)             # (B,1,H,W) in mm
+            if ENFORCE_SUM_CONSISTENCY:
+                pred_1h_mm_t = enforce_sum_constraint_tensor(pred_1h_mm_t, true_sum_mm_t)
+            pred_sum_mm_t = pred_1h_mm_t.sum(dim=1, keepdim=True)                                # (B,1,H,W)
+            # detach to numpy
+            pred_1h = pred_1h_mm_t.detach().cpu().numpy()       # (B,3,H,W)
+            pred_sum = pred_sum_mm_t.detach().cpu().numpy()      # (B,1,H,W)
+            true_1h = true_1h_mm_t.detach().cpu().numpy()
+            true_sum = true_sum_mm_t.detach().cpu().numpy()
             B, _, H, W = outputs.shape
 
             # バイナリ（時刻別・積算）
@@ -658,7 +853,23 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
 # ==============================================================================
 @torch.no_grad()
 def visualize_final_results(rank, world_size, valid_dataset, best_model_path, result_img_dir, main_logger, exec_log_path):
-    """検証データ全体での可視化: 2x4配置(左に積算 予測/正解 + 各時刻 予測/正解)、LogNormで見やすく"""
+    """
+    概要:
+        最良モデルを用いて検証データ全体を可視化する。2x4 パネル（予測:積算/ft4/5/6、正解:同）で PNG を保存。
+    引数:
+        rank (int): GPU ランク（rank0 のみ実行）。
+        world_size (int): GPU 総数。
+        valid_dataset (Dataset): 検証データセット（lon/lat/get_time を利用）。
+        best_model_path (str): 最良モデル（.pth）へのパス。
+        result_img_dir (str): 画像出力ディレクトリ。
+        main_logger (Logger|None): ロガー。
+        exec_log_path (str): tqdm 出力ファイル。
+    処理:
+        - rank0 のみモデルをロードして推論、min-max 逆変換＋和一致補正を適用。
+        - LogNorm で見やすくし、地図レイヤ付きで保存。失敗時は通常Axesへフォールバック。
+    戻り値:
+        なし（副作用として PNG ファイル保存）
+    """
     # DDP安全化: 可視化はrank 0のみで実行（Cartopyの同時アクセスを回避）
     if rank != 0:
         return
@@ -698,8 +909,18 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
 
             with autocast(device_type='cuda', dtype=AMP_TORCH_DTYPE):
                 output = model(inputs)
-            output = torch.relu(output).squeeze(0).cpu()  # (3, H, W)
-            pred_sum = output.sum(dim=0)  # (H, W)
+            output = torch.relu(output).squeeze(0)  # (3, H, W) on device
+
+            # min-max逆変換 + 積算一致補正（描画はmmスケールで統一）
+            gm = load_group_minmax()
+            output_mm = inverse_precip_tensor(output.float().unsqueeze(0), gm).squeeze(0).cpu()           # (3,H,W)
+            target_1h_mm = inverse_precip_tensor(target_1h.float().unsqueeze(0), gm).squeeze(0).cpu()     # (3,H,W)
+            target_sum_mm = inverse_precip_tensor(target_sum.float().unsqueeze(0).unsqueeze(0), gm).squeeze(0).cpu()  # (H,W)
+            if ENFORCE_SUM_CONSISTENCY:
+                pred_1h_mm = enforce_sum_constraint_tensor(output_mm.unsqueeze(0), target_sum_mm.unsqueeze(0).unsqueeze(0)).squeeze(0)
+            else:
+                pred_1h_mm = output_mm
+            pred_sum = pred_1h_mm.sum(dim=0)  # (H, W)
 
             # 対数色スケール設定 (LogNorm)
             cmap = plt.get_cmap("Blues")
@@ -709,9 +930,9 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             # vmaxは外れ値に影響されにくいように8枚の99パーセンタイルで決定
             stack_vals = torch.stack([
                 pred_sum,
-                target_sum,
-                output[0], output[1], output[2],
-                target_1h[0], target_1h[1], target_1h[2]
+                target_sum_mm,
+                pred_1h_mm[0], pred_1h_mm[1], pred_1h_mm[2],
+                target_1h_mm[0], target_1h_mm[1], target_1h_mm[2]
             ], dim=0).numpy()
             flat = stack_vals.reshape(8, -1)
             flat_pos = flat[flat > 0.0]
@@ -727,8 +948,8 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             fig.suptitle(f"Validation Time: {np.datetime_as_string(time_val, unit='m')}", fontsize=16)
 
             plot_data = [
-                pred_sum.numpy(), output[0].numpy(), output[1].numpy(), output[2].numpy(),
-                target_sum.numpy(), target_1h[0].numpy(), target_1h[1].numpy(), target_1h[2].numpy()
+                pred_sum.numpy(), pred_1h_mm[0].numpy(), pred_1h_mm[1].numpy(), pred_1h_mm[2].numpy(),
+                target_sum_mm.numpy(), target_1h_mm[0].numpy(), target_1h_mm[1].numpy(), target_1h_mm[2].numpy()
             ]
             titles = [
                 'Prediction Accum (4-6h sum)', 'Prediction FT+4', 'Prediction FT+5', 'Prediction FT+6',
@@ -770,6 +991,17 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
                 plt.close(fig)
 
 def plot_loss_curve(history, save_path, logger, best_epoch):
+    """
+    概要:
+        学習/検証の合計損失と RMSE（1h/sum）のエポック推移をプロットして保存する。
+    引数:
+        history (Dict[str, List[float]]): 'train_loss','val_loss','train_1h_rmse','val_1h_rmse','train_sum_rmse','val_sum_rmse'。
+        save_path (str): 保存先パス。
+        logger (Logger): ロガー。
+        best_epoch (int): 最良エポック（1始まり、無ければ -1）。
+    戻り値:
+        なし
+    """
     plt.figure(figsize=(12, 8))
     epochs_range = range(1, len(history['train_loss']) + 1)
     
@@ -803,6 +1035,14 @@ def plot_loss_curve(history, save_path, logger, best_epoch):
     logger.info(f"Loss curve saved to '{save_path}'.")
 
 def _class_labels_from_bins(bins):
+    """
+    概要:
+        連続ビン境界から可読なラベル（例: '0-5','5-10','10+'）を生成する。
+    引数:
+        bins (List[float]): ビン境界（最後の境界は +inf を想定）。
+    戻り値:
+        List[str]: クラスラベル配列。
+    """
     labels = []
     for i in range(len(bins)-1):
         left = bins[i]
@@ -814,7 +1054,16 @@ def _class_labels_from_bins(bins):
     return labels
 
 def plot_epoch_metrics(metric_history, out_dir, logger):
-    """各評価指標のエポック推移をまとめて図に保存"""
+    """
+    概要:
+        各種評価指標（Binary, Categorical, RMSE, Wet-hour）のエポック推移をまとめて図に保存する。
+    引数:
+        metric_history (Dict): validate_one_epoch の 'epoch_metrics' を各エポックで蓄積した構造。
+        out_dir (str): 出力ディレクトリ。
+        logger (Logger): ロガー。
+    戻り値:
+        なし（複数 PNG を保存）
+    """
     os.makedirs(out_dir, exist_ok=True)
     epochs = np.arange(1, metric_history['num_epochs'] + 1)
 
@@ -915,7 +1164,21 @@ def plot_epoch_metrics(metric_history, out_dir, logger):
 
 @torch.no_grad()
 def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger):
-    """最終モデルの評価（v5仕様: 拡張メトリクスを一括計算）"""
+    """
+    概要:
+        最終モデルを用いて検証データ全体を評価し、拡張メトリクス（Binary/カテゴリ/RMSE/Wet-hour）をテキストに出力。
+    引数:
+        model_path (str): .pth のモデルファイル。
+        valid_dataset (Dataset): 検証データセット。
+        device (torch.device): 評価に使用するデバイス。
+        eval_log_path (str): 結果の出力パス。
+        main_logger (Logger): ロガー。
+    処理:
+        - DataLoader で一括推論、min-max 逆変換＋和一致補正の mm スケールで集計。
+        - 等分割ベースラインとの RMSE 比較を含む。
+    戻り値:
+        なし（副作用として eval_log_path に詳細を出力）
+    """
     main_logger.info("Starting final model evaluation (v5)...")
     
     model = SwinTransformerSys(**MODEL_ARGS).to(device)
@@ -951,11 +1214,20 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
             outputs = model(inputs)
         outputs = torch.relu(outputs)
 
-        # bf16対応: numpy変換前にfloat32へ変換
-        pred_1h = outputs.detach().float().cpu().numpy()
-        true_1h = targ_1h.detach().float().cpu().numpy()
-        pred_sum = outputs.sum(dim=1, keepdim=True).detach().float().cpu().numpy()
-        true_sum = targ_sum.detach().float().cpu().numpy()
+        # min-max逆変換 + 積算一致補正（評価用はmmスケールで実施）
+        gm = load_group_minmax()
+        pred_1h_mm_t = inverse_precip_tensor(outputs.float(), gm)                   # (B,3,H,W)
+        true_1h_mm_t = inverse_precip_tensor(targ_1h.float(), gm)                  # (B,3,H,W)
+        true_sum_mm_t = inverse_precip_tensor(targ_sum.float(), gm)                # (B,1,H,W)
+        if ENFORCE_SUM_CONSISTENCY:
+            pred_1h_mm_t = enforce_sum_constraint_tensor(pred_1h_mm_t, true_sum_mm_t)
+        pred_sum_mm_t = pred_1h_mm_t.sum(dim=1, keepdim=True)
+
+        # numpyへ
+        pred_1h = pred_1h_mm_t.detach().cpu().numpy()
+        true_1h = true_1h_mm_t.detach().cpu().numpy()
+        pred_sum = pred_sum_mm_t.detach().cpu().numpy()
+        true_sum = true_sum_mm_t.detach().cpu().numpy()
         B, _, H, W = outputs.shape
 
         for thr in BINARY_THRESHOLDS_MM_1H:
@@ -1103,8 +1375,18 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
 
 def create_video_from_images(image_dir, output_path, fps, logger):
     """
-    画像群を連結して動画作成（MP4, libx264）
-    imageioが未インストールならスキップ
+    概要:
+        検証画像（validation_*.png）を連結して MP4 動画を作成する（libx264）。
+    引数:
+        image_dir (str): 画像が格納されたディレクトリ。
+        output_path (str): 出力動画パス（.mp4）。
+        fps (int): フレームレート。
+        logger (Logger): ロガー。
+    処理:
+        - imageio が無ければ警告してスキップ。
+        - 昇順に画像を読み込み、エンコーダで逐次書き込み。
+    戻り値:
+        なし（副作用として MP4 を出力）
     """
     if not IMAGEIO_AVAILABLE:
         logger.warning("imageioが見つからないため、動画作成をスキップします。pip install imageio imageio-ffmpeg を検討してください。")
@@ -1134,6 +1416,22 @@ def create_video_from_images(image_dir, output_path, fps, logger):
 # 7. メインワーカ関数
 # ==============================================================================
 def main_worker(rank, world_size, train_files, valid_files):
+    """
+    概要:
+        単一 GPU プロセスのワーカー。DDP 初期化から学習/検証/可視化/評価/動画化までを実行する。
+    引数:
+        rank (int): GPU ランク。
+        world_size (int): 総GPU数。
+        train_files (List[str]): 学習ファイルパス。
+        valid_files (List[str]): 検証ファイルパス。
+    処理:
+        - 乱数固定、DDP 初期化、データローダ構築、モデル/DDP/最適化器/AMP 準備。
+        - エポックループで学習/検証、最良モデル保存、メトリクス履歴蓄積。
+        - rank0 で可視化・プロット・評価・動画化を実行。
+        - DDP 後処理。
+    戻り値:
+        なし
+    """
     set_seed(RANDOM_SEED)
     setup_ddp(rank, world_size)
     

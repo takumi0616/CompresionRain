@@ -132,6 +132,17 @@ EPS = 1e-6
 # 1.5. 再現性確保のための関数
 # ==============================================================================
 def set_seed(seed):
+    """
+    概要:
+        乱数シードを固定して、学習・評価の再現性を確保する。
+    引数:
+        seed (int): 固定する乱数シード値。
+    処理:
+        - Python 標準 random、NumPy、PyTorch (CPU/GPU) の乱数生成器に同じ seed を設定。
+        - cuDNN の挙動を deterministic/banchmark=False に設定し、計算の再現性を高める。
+    戻り値:
+        なし（副作用として各ライブラリの乱数状態が設定される）
+    """
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
@@ -143,6 +154,19 @@ def set_seed(seed):
 
 
 def get_monthly_files(data_dir, years, logger=None):
+    """
+    概要:
+        指定した年リストに対応する月次NetCDFファイル群を data_dir から収集する。
+    引数:
+        data_dir (str): 入力NetCDFディレクトリ（例: './output_nc'）。
+        years (List[int]): 収集対象の年のリスト。
+        logger (logging.Logger | None): ロガー。None の場合は print を使用。
+    処理:
+        - 各年についてパターン '{year}*.nc' でファイルを glob 検索し、昇順ソートして結合。
+        - 見つからない場合は警告ログ、見つかった場合は件数を情報ログに出力。
+    戻り値:
+        List[str]: 見つかったファイルパスのリスト（ソート済み、年を跨いで連結）。
+    """
     files = []
     log_func = logger.info if logger else print
     for year in years:
@@ -159,6 +183,20 @@ def get_monthly_files(data_dir, years, logger=None):
 # 2. ロギング設定関数
 # ==============================================================================
 def setup_loggers():
+    """
+    概要:
+        メインロガーを初期化し、ファイル出力と標準出力への同時ロギングを有効化する。
+    引数:
+        なし
+    処理:
+        - ログフォーマット（時刻・レベル・メッセージ）を設定。
+        - main_logger を作成し、ファイル（MAIN_LOG_PATH）とコンソール双方にハンドラを登録。
+        - 実行ログ/評価ログ用のファイルを初期化。
+    戻り値:
+        Tuple[logging.Logger, str]:
+            - メインロガー
+            - 実行ログパス（EXEC_LOG_PATH）
+    """
     main_logger = logging.getLogger('main')
     main_logger.setLevel(logging.INFO)
     if main_logger.hasHandlers():
@@ -185,11 +223,33 @@ def setup_loggers():
 # 3. DDPセットアップ / クリーンアップ関数
 # ==============================================================================
 def setup_ddp(rank, world_size):
+    """
+    概要:
+        PyTorch DistributedDataParallel(DDP) を初期化する。
+    引数:
+        rank (int): このプロセスのGPUランク（0..world_size-1）。
+        world_size (int): 使用するGPU（プロセス）数。
+    処理:
+        - 環境変数 MASTER_ADDR/MASTER_PORT を設定（単一ノード想定）。
+        - NCCL バックエンドでプロセスグループを初期化。
+    戻り値:
+        なし（副作用としてDDPが有効化される）
+    """
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
 def cleanup_ddp():
+    """
+    概要:
+        DDP のプロセスグループを安全に破棄して終了処理を行う。
+    引数:
+        なし
+    処理:
+        - torch.distributed.destroy_process_group を呼び出す。
+    戻り値:
+        なし
+    """
     dist.destroy_process_group()
 
 # ==============================================================================
@@ -197,7 +257,19 @@ def cleanup_ddp():
 # ==============================================================================
 def open_dataset_robust(path, logger):
     """
-    h5netcdf (with hdf5plugin) を優先し、失敗時は netcdf4 にフォールバック。
+    概要:
+        NetCDF を堅牢に開くユーティリティ。h5netcdf(+hdf5plugin) を優先し、失敗時は netcdf4 にフォールバックする。
+    引数:
+        path (str): NetCDF ファイルパス。
+        logger (logging.Logger | None): ロガー。警告/エラー出力に使用。None なら無言で例外を投げる。
+    処理:
+        - engine='h5netcdf' で open_dataset を試行。
+        - 失敗した場合、engine='netcdf4' + lock=False に切替えて再試行。
+        - 双方失敗時はエラーログを出して例外を再送出。
+    戻り値:
+        xarray.Dataset: 開かれたデータセット。呼び出し側で close すること。
+    例外:
+        いずれのエンジンでも開けない場合は例外を送出。
     """
     try:
         ds = xr.open_dataset(path, engine='h5netcdf')
@@ -215,13 +287,41 @@ def open_dataset_robust(path, logger):
 
 class NetCDFDataset(Dataset):
     """
-    メモリ常駐を避け、SSD上のNetCDFから必要な時刻スライスだけをオンデマンドで読み込む実装。
-    - 全ファイルをまとめて open_mfdataset せず、各ファイルの time 長だけをメタデータとして保持
-    - __getitem__ では (グローバルidx) -> (対象ファイル, ローカルidx) に変換し、そのスライスのみを読み込み
-    - 直近の1ファイルだけを開いたままキャッシュし、ファイルを跨いだら前のハンドルを閉じる
-    これにより、巨大配列をRAMに展開せず、SSDからの逐次I/O中心で動作します。
+    概要:
+        大規模な月次NetCDF群を対象に、RAM 常駐を避けつつ SSD からオンデマンドで1ステップずつ読み込むデータセット。
+    入力:
+        - file_paths (List[str | Path]): 月次NetCDFのパス群。全ファイルで (lat, lon) 形状が同一である前提。
+    主要処理:
+        - 先頭ファイルから空間次元（lat, lon）と座標値を取得。
+        - 各ファイルの time 長のみメタデータとして取得し、累積カウントを持つことで
+          グローバルidx -> (ファイル, ローカルidx) を二分探索で即時変換。
+        - 直近1ファイルの Dataset ハンドルをキャッシュし、ファイル跨ぎで安全にクローズ・切替。
+        - __getitem__ では必要スライスのみを読み出し、入力/出力テンソルを構築（チャネル結合）。
+    出力:
+        - __len__(): 全期間の総 time ステップ数。
+        - __getitem__(idx): dict {'input': Tensor[C,H,W], 'target_1h': Tensor[3,H,W], 'target_sum': Tensor[1,H,W]}。
+    注意:
+        - .load() は呼ばず遅延ロードを維持（必要スライスのみI/O）。
+        - TIME_VARS はスカラーを HxW に複製してチャネル化（メモリ影響は小）。
     """
     def __init__(self, file_paths, logger=None):
+        """
+        概要:
+            データセットを初期化し、空間次元・座標・各ファイルの time 長を読み取ってインデックスを構築する。
+        引数:
+            file_paths (List[str | Path]): 入力NetCDFファイル群（存在確認あり）。
+            logger (logging.Logger | None): ロガー（None の場合は main ロガーを利用）。
+        処理:
+            - ファイル存在チェック。
+            - 先頭ファイルから (lat, lon) サイズと座標値を取得。
+            - 各ファイルの time サイズのみを取得して累積長配列（cum_counts）を作成。
+            - キャッシュ用のパス/ハンドルを初期化。
+        戻り値:
+            なし
+        例外:
+            - file_paths が空のとき ValueError。
+            - ファイルが見つからない場合 FileNotFoundError。
+        """
         super().__init__()
         self.logger = logger if logger else logging.getLogger('main')
         if not file_paths:
@@ -254,6 +354,16 @@ class NetCDFDataset(Dataset):
         self.logger.info(f"データセット初期化完了: 総時間ステップ数={self.time_len}, 画像サイズ={self.img_dims}")
 
     def __del__(self):
+        """
+        概要:
+            キャッシュ済みの Dataset ハンドルが存在する場合に安全にクローズするデストラクタ。
+        引数:
+            なし
+        処理:
+            - 例外に寛容に、close() を試みる。
+        戻り値:
+            なし
+        """
         try:
             if self._cache_ds is not None:
                 self._cache_ds.close()
@@ -261,7 +371,17 @@ class NetCDFDataset(Dataset):
             pass
 
     def _get_ds(self, path):
-        """直近1ファイルのみ開いたままにする簡易キャッシュ"""
+        """
+        概要:
+            直近で開いた1ファイルのみをキャッシュし、同一パスなら再利用、異なる場合は前ハンドルをクローズして切替。
+        引数:
+            path (str | Path): 開きたいNetCDFファイルパス。
+        処理:
+            - キャッシュが同一パスならそのまま返す。
+            - 異なるパスなら既存キャッシュを close し、open_dataset_robust で新規に開いてキャッシュ更新。
+        戻り値:
+            xarray.Dataset: 開いた Dataset ハンドル。
+        """
         if self._cache_path == path and self._cache_ds is not None:
             return self._cache_ds
         # 切り替え時に前のDSを閉じる
@@ -277,10 +397,30 @@ class NetCDFDataset(Dataset):
         return self._cache_ds
 
     def __len__(self):
+        """
+        概要:
+            全ファイルを通した総時間ステップ数を返す。
+        引数:
+            なし
+        戻り値:
+            int: 総サンプル数（= 全 time の合計）。
+        """
         return self.time_len
 
     def global_to_file_index(self, idx: int):
-        """グローバルidx -> (ファイルパス, ローカルidx, ファイル番号) を返す"""
+        """
+        概要:
+            グローバルインデックスを (対象ファイルパス, ファイル内ローカルインデックス, ファイル番号) に変換する。
+        引数:
+            idx (int): 0..time_len-1 のグローバル時刻インデックス。負数は Python の負インデックス規則で末尾から。
+        処理:
+            - cum_counts に対して二分探索して所属ファイルを同定。
+            - 累積長からローカル idx を算出。
+        戻り値:
+            Tuple[str, int, int]: (ファイルパス, ローカルidx, file_idx)
+        例外:
+            IndexError: 範囲外 idx のとき。
+        """
         if idx < 0:
             idx += self.time_len
         if idx < 0 or idx >= self.time_len:
@@ -291,12 +431,39 @@ class NetCDFDataset(Dataset):
         return self.files[file_idx], local_idx, file_idx
 
     def get_time(self, idx: int):
-        """グローバルidxの time 値（numpy.datetime64）を返す"""
+        """
+        概要:
+            指定グローバル idx の観測時刻（numpy.datetime64）を取得する。
+        引数:
+            idx (int): 0..time_len-1 の時刻インデックス（負数可）。
+        処理:
+            - global_to_file_index で (ファイル, ローカルidx) に変換し、その時刻成分のみ取り出す。
+        戻り値:
+            numpy.datetime64: 対応する時刻。
+        """
         fpath, local_idx, _ = self.global_to_file_index(idx)
         ds = self._get_ds(fpath)
         return ds['time'].isel(time=local_idx).values
 
     def __getitem__(self, idx):
+        """
+        概要:
+            グローバル idx に対応する1サンプル（入力とターゲット）をオンデマンドで構築して返す。
+        引数:
+            idx (int): 取得したいサンプルのグローバルインデックス（負数可）。
+        処理:
+            - 対象ファイルとローカルidxを二分探索で特定し、データセットをキャッシュ経由で取得。
+            - 入力チャネル: 各物理変数の ft3/ft6（2chずつ）＋ 降水（Prec_ft3）＋ 時間特徴（HxW複製）。
+            - ターゲット: 1時間降水(3ch: ft+4/5/6)、3時間積算(1ch)。
+            - NaN は 0 に置換。float32 テンソルで返却。
+        戻り値:
+            Dict[str, torch.Tensor]:
+                - 'input': Tensor[IN_CHANS, H, W]
+                - 'target_1h': Tensor[3, H, W]
+                - 'target_sum': Tensor[1, H, W]
+        例外:
+            IndexError: idx が範囲外のとき。
+        """
         # マイナスidx対応
         if idx < 0:
             idx += self.time_len
@@ -350,10 +517,16 @@ class NetCDFDataset(Dataset):
 
 def _get_weight_map_from_bins(target_tensor, bin_edges, weight_values):
     """
-    target_tensor: 任意shapeのtorch.Tensor（mm）
-    bin_edges: 境界（例: [1,5,10,20,30,50]）
-    weight_values: 各ビンの重み（len = len(bin_edges)+1）
-    戻り: target_tensorと同shapeの重みテンソル
+    概要:
+        値域ビンに基づく画素ごとの重みマップを生成する。頻度不均衡な降水強度に対して重み付けを行うために使用。
+    引数:
+        target_tensor (torch.Tensor): mm単位のターゲット値（任意形状）。
+        bin_edges (List[float]): ビン境界（右開区間、例: [1,5,10,20,30,50]）。
+        weight_values (List[float]): 各ビンの重み。長さは len(bin_edges)+1。
+    処理:
+        - torch.bucketize で各要素のビンIDを求め、対応する重みを選択。
+    戻り値:
+        torch.Tensor: target_tensor と同形状の重みマップ。
     """
     device = target_tensor.device
     dtype = target_tensor.dtype
@@ -365,7 +538,19 @@ def _get_weight_map_from_bins(target_tensor, bin_edges, weight_values):
 
 def _weighted_mse(pred, target, bin_edges, weight_values, eps=1e-8):
     """
-    加重MSE: sum(w * (pred-target)^2) / sum(w)
+    概要:
+        重みマップに基づく加重MSEを計算する。
+    引数:
+        pred (torch.Tensor): 予測値テンソル。
+        target (torch.Tensor): 正解値テンソル（mm）。
+        bin_edges (List[float]): ビン境界。
+        weight_values (List[float]): 各ビンの重み。
+        eps (float): 0除算回避の微小値。
+    処理:
+        - _get_weight_map_from_bins で w を作成。
+        - MSE を w で加重し、sum(w*(e^2)) / (sum(w)+eps) を返す。
+    戻り値:
+        torch.Tensor: スカラー損失（加重MSE）。
     """
     weights = _get_weight_map_from_bins(target, bin_edges, weight_values)
     se = (pred - target) ** 2
@@ -375,9 +560,25 @@ def _weighted_mse(pred, target, bin_edges, weight_values, eps=1e-8):
 
 def custom_loss_function(output, targets):
     """
-    ratio-model: 出力logitsをsoftmaxで比率w(3ch)に変換し、既知の3h積算Sでスケールして1h量を復元。
-    数値安定性確保のため、損失計算はfloat32で実施し、log/除算はclamp/正規化を入れる。
-    量の重み付きMSE + （任意）比率KLを採用。ログ用RMSEは非加重RMSE。
+    概要:
+        ratio-model 用の複合損失を計算する。モデル出力の logits(3ch) を softmax(+温度) で比率 w に変換し、
+        既知の3h積算 S でスケーリングして 1h 予測量を復元。量の加重MSE + （任意）比率のKLを合算。
+    引数:
+        output (Tensor | Tuple[Tensor, Tensor]):
+            - logits: 形状 (B,3,H,W)。temperature_mode が 'dynamic' の場合は (logits, tau_map)。
+        targets (Dict[str, Tensor]):
+            - 'target_1h': (B,3,H,W) の1時間降水実値。
+            - 'target_sum': (B,1,H,W) の3時間積算（拘束条件）。
+    処理:
+        - 温度付き softmax で w を得て、pred_1h = w * S、pred_sum = Σ pred_1h を復元（数値安定の clamp/再正規化あり）。
+        - 加重MSE（1h, sum）を計算（ENABLE_INTENSITY_WEIGHTED_LOSS に従う）。
+        - RATIO_LOSS_WEIGHT>0 のとき、S>0 にマスクした領域で KL(y||w) を追加（y は target_1h を S で正規化）。
+        - ログ用に未加重RMSE（1h, sum）も計算して返す。
+    戻り値:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            - total_loss: 合計損失（スカラー）
+            - rmse_1h: 1h RMSE（未加重）
+            - rmse_sum: 3h積算 RMSE（未加重）
     """
     eps = EPS
 
@@ -447,6 +648,25 @@ def custom_loss_function(output, targets):
     return total_loss, rmse_1h, rmse_sum
 
 def train_one_epoch(rank, model, dataloader, optimizer, scaler, epoch, exec_log_path):
+    """
+    概要:
+        1エポック分の学習を実行し、DDP環境での平均化済み損失メトリクスを返す。
+    引数:
+        rank (int): GPU ランク。
+        model (DDP nn.Module): DDP でラップされたモデル。
+        dataloader (DataLoader): 学習用データローダ（DistributedSampler 使用）。
+        optimizer (torch.optim.Optimizer): 最適化器。
+        scaler (torch.amp.GradScaler): AMP 用スケーラ。
+        epoch (int): 現在のエポック番号（0始まり）。
+        exec_log_path (str): 進捗ログを追記保存するファイルパス。
+    処理:
+        - autocast(fp16) で順伝播、custom_loss_function で損失算出。
+        - AMP + 勾配クリッピング + optimizer step + 学習率スケジューラ更新。
+        - rank0 で進捗表示（tqdm をファイルに出力）。
+        - 全プロセスで平均化（all_reduce(Average)）。
+    戻り値:
+        np.ndarray: [avg_total_loss, avg_1h_rmse, avg_sum_rmse]
+    """
     model.train()
     total_loss, total_1h_rmse, total_sum_rmse = 0.0, 0.0, 0.0
     dataloader.sampler.set_epoch(epoch)
@@ -482,7 +702,18 @@ def train_one_epoch(rank, model, dataloader, optimizer, scaler, epoch, exec_log_
 
 # -------------------- 評価ユーティリティ --------------------
 def _tally_binary(pred, true, thr):
-    """2値判定のTP/TN/FP/FNを返す（pred, trueは同形状テンソル/ndarray, mm単位）"""
+    """
+    概要:
+        2値判定（しきい値 thr 超え）に基づく TP/TN/FP/FN を集計する。
+    引数:
+        pred (np.ndarray | torch.Tensor): 予測（mm）。任意形状、true と同形状。
+        true (np.ndarray | torch.Tensor): 正解（mm）。
+        thr (float): 判定しきい値（mm）。
+    処理:
+        - thr を超えるか否かで2値化し、論理演算で TP/TN/FP/FN を算出。
+    戻り値:
+        Tuple[int, int, int, int]: (tp, tn, fp, fn)
+    """
     pred_bin = pred > thr
     true_bin = true > thr
     tp = np.logical_and(pred_bin, true_bin).sum()
@@ -492,16 +723,37 @@ def _tally_binary(pred, true, thr):
     return tp, tn, fp, fn
 
 def _digitize_bins(x, bins):
-    """連続値をカテゴリbin(右開区間)に割り当てる（numpy.digitize準拠）"""
+    """
+    概要:
+        連続値をカテゴリビン（右開区間）に割り当てる（np.digitize 準拠）。
+    引数:
+        x (np.ndarray): 連続値配列。
+        bins (List[float]): ビン境界（右開）。
+    戻り値:
+        np.ndarray: 0 始まりのカテゴリID配列。
+    """
     return np.digitize(x, bins, right=False) - 1  # 0始まりのカテゴリID
 
 @torch.no_grad()
 def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
     """
-    1エポック分の検証処理 + 全評価指標の集計（DDPでall_reduceして集計）
+    概要:
+        1エポック分の検証を行い、加重損失と拡張評価指標（バイナリ、カテゴリ、RMSE、Wet-hourパターン）を集計する。
+    引数:
+        rank (int): GPU ランク。
+        model (DDP nn.Module): 評価モードで使用するモデル。
+        dataloader (DataLoader): 検証用データローダ。
+        epoch (int): エポック番号（0始まり）。
+        exec_log_path (str): 進捗ログ出力先。
+    処理:
+        - autocast(fp16) で順伝播、custom_loss_function で損失算出。
+        - 追加で、温度付き softmax 比率×S から各種評価量を導出。
+        - DDP all_reduce(SUM/Average) で全プロセス集計。
+        - rank0 で閾値別の Binary 指標、カテゴリ精度/適合率/再現率、RMSE、Wet-hour パターン一致を計算。
     戻り値:
-      - avg_losses: np.array([total_loss, rmse_1h, rmse_sum])
-      - epoch_metrics: dict (rank==0のみ有効、他rankはNone)
+        Tuple[np.ndarray, Optional[Dict]]:
+            - avg_losses: np.array([total_loss, rmse_1h, rmse_sum])（全プロセス平均）
+            - epoch_metrics: dict（rank==0 のみ辞書、他ランクは None）
     """
     model.eval()
     total_loss, total_1h_rmse, total_sum_rmse = 0.0, 0.0, 0.0
@@ -728,7 +980,24 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
 # ==============================================================================
 @torch.no_grad()
 def visualize_final_results(rank, world_size, valid_dataset, best_model_path, result_img_dir, main_logger, exec_log_path):
-    """検証データ全体での可視化: 2x4配置(左に積算 予測/正解 + 各時刻 予測/正解)、LogNormで見やすく"""
+    """
+    概要:
+        最良モデルを用いて検証データ全体の可視化画像を生成する。2x4 パネル（予測:積算/ft4/5/6、正解:同）で保存。
+    引数:
+        rank (int): GPU ランク。
+        world_size (int): 使用GPU数（rank0 のみ実処理）。
+        valid_dataset (NetCDFDataset): 検証データセット（get_time, lon/lat を使用）。
+        best_model_path (str): 学習済み最良モデルのパス（.pth）。
+        result_img_dir (str): 画像出力ディレクトリ。
+        main_logger (logging.Logger | None): ログ出力用。
+        exec_log_path (str): 進捗ログ出力先。
+    処理:
+        - rank0 のみ実行（Cartopy の同時アクセス回避）。
+        - 各サンプルで logits→比率→1h/積算を復元し、LogNorm で視認性を高めてプロット。
+        - Cartopy 失敗時は通常Axesにフォールバック。
+    戻り値:
+        なし（副作用として result_img_dir にPNG保存）
+    """
     # DDP安全化: 可視化はrank 0のみで実行（Cartopyの同時アクセスを回避）
     if rank != 0:
         return
@@ -855,6 +1124,17 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
                 plt.close(fig)
 
 def plot_loss_curve(history, save_path, logger, best_epoch):
+    """
+    概要:
+        学習/検証の損失と RMSE 推移を図に保存する。
+    引数:
+        history (Dict[str, List[float]]): 'train_loss','val_loss','train_1h_rmse','val_1h_rmse','train_sum_rmse','val_sum_rmse'。
+        save_path (str): 保存先パス。
+        logger (logging.Logger): ロガー。
+        best_epoch (int): 最良エポック（1始まり、未設定は -1）。
+    戻り値:
+        なし（副作用として画像ファイルを保存）
+    """
     plt.figure(figsize=(12, 8))
     epochs_range = range(1, len(history['train_loss']) + 1)
     
@@ -888,6 +1168,14 @@ def plot_loss_curve(history, save_path, logger, best_epoch):
     logger.info(f"Loss curve saved to '{save_path}'.")
 
 def _class_labels_from_bins(bins):
+    """
+    概要:
+        連続ビン境界から可読なクラスラベル（例: '0-5', '5-10', '10+'）を生成する。
+    引数:
+        bins (List[float]): ビン境界（最後は +∞ を暗黙的に想定）。
+    戻り値:
+        List[str]: クラスラベルのリスト。
+    """
     labels = []
     for i in range(len(bins)-1):
         left = bins[i]
@@ -899,7 +1187,20 @@ def _class_labels_from_bins(bins):
     return labels
 
 def plot_epoch_metrics(metric_history, out_dir, logger):
-    """各評価指標のエポック推移をまとめて図に保存"""
+    """
+    概要:
+        各種評価指標（Binary, Categorical, RMSE, Wet-hour）のエポック推移をまとめて可視化して保存する。
+    引数:
+        metric_history (Dict): validate_one_epoch から収集した各指標のエポック配列。
+        out_dir (str): 画像出力ディレクトリ。
+        logger (logging.Logger): ロガー。
+    処理:
+        - 閾値別 Binary 指標（accuracy/precision/recall/F1/CSI）をエポック曲線で保存（hourly/sum）。
+        - Categorical 指標（overall acc, per-class precision/recall）を保存（hourly/sum）。
+        - RMSE のモデル vs equal-split 比較、sum RMSE、Wet-hour 一致率の推移を保存。
+    戻り値:
+        なし（副作用として out_dir に複数PNGを保存）
+    """
     os.makedirs(out_dir, exist_ok=True)
     epochs = np.arange(1, metric_history['num_epochs'] + 1)
 
@@ -1000,7 +1301,22 @@ def plot_epoch_metrics(metric_history, out_dir, logger):
 
 @torch.no_grad()
 def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger):
-    """最終モデルの評価（ratio仕様: 拡張メトリクスを一括計算）"""
+    """
+    概要:
+        最終モデルで検証データ全体を評価し、閾値別 Binary 指標、カテゴリ指標、RMSE、Wet-hour パターン一致をテキストに出力。
+    引数:
+        model_path (str): 学習済みモデル（.pth）。
+        valid_dataset (NetCDFDataset): 検証データセット。
+        device (torch.device): 評価に使用するデバイス。
+        eval_log_path (str): 評価結果のテキスト出力先。
+        main_logger (logging.Logger): ロガー。
+    処理:
+        - DataLoader で一括評価し、numpy に落として全量を逐次集計。
+        - equal-split ベースラインとの 1h RMSE 比較も算出。
+        - 結果は eval_log_path に詳細出力。
+    戻り値:
+        なし（副作用としてログファイルを出力）
+    """
     main_logger.info("Starting final model evaluation (ratio)...")
     
     model = SwinTransformerSys(
@@ -1206,6 +1522,25 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
 # 7. メインワーカ関数
 # ==============================================================================
 def main_worker(rank, world_size, train_files, valid_files):
+    """
+    概要:
+        単一プロセス（=単一GPU）のワーカ。DDP 初期化・データセット/ローダ構築・学習/検証ループ・
+        可視化/プロット/評価・後始末までを担当する。
+    引数:
+        rank (int): GPU ランク。
+        world_size (int): 総GPU数。
+        train_files (List[str]): 学習用NetCDFファイル群。
+        valid_files (List[str]): 検証用NetCDFファイル群。
+    処理:
+        - 乱数固定、DDP 初期化。
+        - NetCDFDataset/DistributedSampler/DataLoader 構築。
+        - SwinTransformerSys モデル/DDP/最適化器/AMP スケーラ/スケジューラ設定。
+        - NUM_EPOCHS だけ学習・検証、最良モデル保存とメトリクス履歴の蓄積。
+        - rank0 で可視化・プロット・最終評価を実行。
+        - DDP 後始末。
+    戻り値:
+        なし
+    """
     set_seed(RANDOM_SEED)
     setup_ddp(rank, world_size)
     
