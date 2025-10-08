@@ -53,12 +53,44 @@ warnings.filterwarnings("ignore", category=UserWarning)
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
 os.environ['HDF5_DISABLE_VERSION_CHECK'] = '1'
 
+# === scaler (group minmax) utilities for inverse conversion (optimization_nc -> mm) ===
+SCALER_JSON_PATH = os.path.join(os.path.dirname(__file__), "scaler_groups.json")
+_group_minmax_cache = None
+def load_group_minmax(path: str = SCALER_JSON_PATH):
+    global _group_minmax_cache
+    if _group_minmax_cache is not None:
+        return _group_minmax_cache
+    try:
+        import json
+        with open(path, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+        _group_minmax_cache = meta.get('group_minmax', {}) or {}
+    except Exception:
+        _group_minmax_cache = {}
+    return _group_minmax_cache
+
+def inverse_precip_tensor(t, group_minmax: dict):
+    if t is None:
+        return t
+    gm = group_minmax.get('precip') if isinstance(group_minmax, dict) else None
+    if not gm:
+        return t
+    gmin = float(gm.get('min', 0.0))
+    gmax = float(gm.get('max', 1.0))
+    scale = (gmax - gmin) if (gmax - gmin) > 1e-12 else 1.0
+    if isinstance(t, torch.Tensor):
+        return t * scale + gmin
+    elif isinstance(t, np.ndarray):
+        return t.astype(np.float32, copy=False) * scale + gmin
+    else:
+        return t
+
 # ==============================================================================
 # 1. 設定 & ハイパーパラメータ
 # ==============================================================================
 
 # --- データパス設定 ---
-DATA_DIR = './output_nc'
+DATA_DIR = './optimization_nc'
 TRAIN_YEARS = [2018, 2019, 2020, 2021]
 VALID_YEARS = [2022]
 
@@ -129,13 +161,13 @@ ENABLE_INTENSITY_WEIGHTED_LOSS = True  # Trueで有効化
 # 1時間降水の重み（ビン境界と各ビンの重み）
 # 境界は [1, 5, 10, 20, 30, 50]（右開区間）。重みは len(boundaries)+1 個。
 INTENSITY_WEIGHT_BINS_1H = [1.0, 5.0, 10.0, 20.0, 30.0, 50.0]  # mm/h
-INTENSITY_WEIGHT_VALUES_1H = [1.0, 1.1, 1.3, 2.2, 9.7, 25.7, 100.0]
+INTENSITY_WEIGHT_VALUES_1H = [1.0, 1.2, 1.5, 2.0, 3.0, 5.0, 10.0]
 
 # 3時間積算（sum）は1hの2倍スケールのビン境界＋段階的な整数重み（頻度不均衡の緩和）
 # 例: 1hの50mmに対してsumは100mmまで（2倍スケール）
 INTENSITY_WEIGHT_BINS_SUM = [2.0, 10.0, 20.0, 40.0, 60.0, 100.0]  # mm/3h
 # 不均衡を考慮した穏やかな昇順の整数重み（過度に大きな係数は避けつつ、強雨ほど重視）
-INTENSITY_WEIGHT_VALUES_SUM = [1.0, 1.1, 1.3, 2.2, 9.7, 25.7, 100.0]
+INTENSITY_WEIGHT_VALUES_SUM = [1.0, 1.2, 1.5, 2.0, 3.0, 5.0, 10.0]
 # 比率モデル用の追加ハイパラ
 RATIO_LOSS_WEIGHT = 0.2  # 比率KLの重み（0で無効）
 EPS = 1e-6
@@ -527,6 +559,11 @@ class NetCDFDataset(Dataset):
         target_sum_tensor = torch.from_numpy(
             np.nan_to_num(sample[TARGET_VAR_SUM].values).astype(np.float32, copy=False)
         ).unsqueeze(0)
+
+        # optimization_nc: targets are 0-1 normalized; convert only precipitation targets back to mm
+        gm = load_group_minmax()
+        target_1h_tensor = inverse_precip_tensor(target_1h_tensor, gm).float()
+        target_sum_tensor = inverse_precip_tensor(target_sum_tensor, gm).float()
 
         return {"input": input_tensor, "target_1h": target_1h_tensor, "target_sum": target_sum_tensor}
 
@@ -1041,10 +1078,10 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
     # DDP安全化: 可視化はrank 0のみで実行（Cartopyの同時アクセスを回避）
     if rank != 0:
         return
-    if not CARTOPY_AVAILABLE:
+    use_cartopy = CARTOPY_AVAILABLE
+    if not use_cartopy:
         if rank == 0:
-            main_logger.warning("Cartopyが見つからないため、最終的な可視化をスキップします。")
-        return
+            main_logger.warning("Cartopyが見つからないため、地図レイヤ無しの可視化にフォールバックします。")
 
     device = torch.device(f"cuda:{rank}")
     model = SwinTransformerSys(
@@ -1129,7 +1166,7 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             norm = LogNorm(vmin=vmin_val, vmax=vmax_val)
 
             # 2行4列の図: 上段(予測: 積算, ft+4, ft+5, ft+6) 下段(正解: 積算, ft+4, ft+5, ft+6)
-            fig, axes = plt.subplots(2, 4, figsize=(24, 12), subplot_kw={'projection': ccrs.PlateCarree()})
+            fig, axes = plt.subplots(2, 4, figsize=(24, 12), subplot_kw={'projection': ccrs.PlateCarree()} if use_cartopy else {})
             time_val = valid_dataset.get_time(idx)
             fig.suptitle(f"Validation Time: {np.datetime_as_string(time_val, unit='m')}", fontsize=16)
 
@@ -1144,14 +1181,16 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             ]
 
             for i, ax in enumerate(axes.flat):
-                ax.set_extent(map_extent, crs=ccrs.PlateCarree())
-                ax.add_feature(cfeature.COASTLINE, edgecolor='black')
-                ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='black')
-                gl = ax.gridlines(draw_labels=True, dms=True, x_inline=False, y_inline=False, color='gray', alpha=0.5)
-                gl.top_labels = False
-                gl.right_labels = False
-                
-                im = ax.imshow(plot_data[i], extent=map_extent, origin='upper', cmap=cmap, norm=norm)
+                if use_cartopy:
+                    ax.set_extent(map_extent, crs=ccrs.PlateCarree())
+                    ax.add_feature(cfeature.COASTLINE, edgecolor='black')
+                    ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='black')
+                    gl = ax.gridlines(draw_labels=True, dms=True, x_inline=False, y_inline=False, color='gray', alpha=0.5)
+                    gl.top_labels = False
+                    gl.right_labels = False
+                    im = ax.imshow(plot_data[i], extent=map_extent, origin='upper', cmap=cmap, norm=norm)
+                else:
+                    im = ax.imshow(plot_data[i], origin='upper', cmap=cmap, norm=norm)
                 ax.set_title(titles[i])
                 fig.colorbar(im, ax=ax, shrink=0.7, label='Precipitation (mm) [Log scale]')
 

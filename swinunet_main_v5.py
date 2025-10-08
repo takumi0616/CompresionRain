@@ -49,8 +49,11 @@ import logging
 import sys
 import random
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from bisect import bisect_right
+import tempfile
+import datetime
 # 任意依存関係（存在しない場合は機能をスキップ）
 try:
     import hdf5plugin  # noqa: F401
@@ -81,6 +84,11 @@ except Exception as e:
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
 os.environ['HDF5_DISABLE_VERSION_CHECK'] = '1'
+# NCCLのエラーを早期に検出し、ハングを避けるための推奨環境変数
+os.environ.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
+os.environ.setdefault('TORCH_NCCL_BLOCKING_WAIT', '1')
+os.environ.setdefault('NCCL_BLOCKING_WAIT', '1')
+os.environ.setdefault('NCCL_DEBUG', 'WARN')
 
 # AMP dtype mapping from config ("fp16" or "bf16")
 AMP_TORCH_DTYPE = torch.float16 if AMP_DTYPE == 'fp16' else torch.bfloat16
@@ -89,7 +97,7 @@ AMP_TORCH_DTYPE = torch.float16 if AMP_DTYPE == 'fp16' else torch.bfloat16
 # Min-Max 逆変換ユーティリティ（scaler_groups.json を使用）
 # ==============================================================================
 SCALER_JSON_PATH = os.path.join(os.path.dirname(__file__), "scaler_groups.json")
-ENFORCE_SUM_CONSISTENCY = True  # 逆変換後に3時間積算（和）が一致するようにスケーリングを適用する
+ENFORCE_SUM_CONSISTENCY = False  # 評価では適用しない（可視化等の後処理用途のみ）
 
 _group_minmax_cache = None
 def load_group_minmax(path: str = SCALER_JSON_PATH):
@@ -260,18 +268,24 @@ def setup_loggers():
 def setup_ddp(rank, world_size):
     """
     概要:
-        単一ノード想定で NCCL バックエンドにより DDP を初期化する。
+        単一ノード想定で DDP を初期化する。CUDAが使えない/不安定な環境ではglooにフォールバック。
     引数:
         rank (int): このプロセスの GPU ランク。
         world_size (int): 総プロセス（GPU）数。
     処理:
-        - MASTER_ADDR/MASTER_PORT を設定し、init_process_group を呼び出す。
+        - MASTER_ADDR/MASTER_PORT を設定し、init_process_group を呼び出す（タイムアウト指定）。
     戻り値:
         なし
     """
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(
+        backend=backend,
+        rank=rank,
+        world_size=world_size,
+        timeout=datetime.timedelta(seconds=1800)  # 30分に延長（必要に応じて変更）
+    )
 
 def cleanup_ddp():
     """
@@ -282,7 +296,15 @@ def cleanup_ddp():
     戻り値:
         なし
     """
-    dist.destroy_process_group()
+    if is_distributed_active():
+        dist.destroy_process_group()
+
+def is_distributed_active() -> bool:
+    """
+    概要:
+        torch.distributed が初期化済みかを返す（all_reduceやbarrierの条件分岐用）。
+    """
+    return dist.is_available() and dist.is_initialized()
 
 # ==============================================================================
 # 4. データセットクラスの定義
@@ -309,7 +331,7 @@ class NetCDFDataset(Dataset):
         self._cache_ds = None
 
         # 画像サイズは先頭ファイルから取得（lat/lon次元は全ファイルで同一前提）
-        with xr.open_dataset(self.files[0], engine='netcdf4', lock=False) as ds0:
+        with xr.open_dataset(self.files[0], engine='h5netcdf', lock=False) as ds0:
             self.img_dims = (ds0.sizes['lat'], ds0.sizes['lon'])
             self.lon = ds0['lon'].values
             self.lat = ds0['lat'].values
@@ -317,7 +339,7 @@ class NetCDFDataset(Dataset):
         # 各ファイルの time 長を取得（メタデータのみ）
         self.file_time_lens = []
         for fp in self.files:
-            with xr.open_dataset(fp, engine='netcdf4', lock=False) as ds_meta:
+            with xr.open_dataset(fp, engine='h5netcdf', lock=False) as ds_meta:
                 self.file_time_lens.append(int(ds_meta.sizes['time']))
 
         # 累積長（2分探索で (idx -> file) を即時変換）
@@ -346,7 +368,7 @@ class NetCDFDataset(Dataset):
                 pass
             self._cache_ds = None
             self._cache_path = None
-        self._cache_ds = xr.open_dataset(path, engine='netcdf4', lock=False)
+        self._cache_ds = xr.open_dataset(path, engine='h5netcdf', lock=False)
         self._cache_path = path
         return self._cache_ds
 
@@ -415,6 +437,10 @@ class NetCDFDataset(Dataset):
         target_sum_tensor = torch.from_numpy(
             np.nan_to_num(sample[TARGET_VAR_SUM].values).astype(np.float32, copy=False)
         ).unsqueeze(0)
+        # optimization_nc: ターゲット（降水）は0-1正規化済みなのでmmへ逆変換
+        gm = load_group_minmax()
+        target_1h_tensor = inverse_precip_tensor(target_1h_tensor, gm).float()
+        target_sum_tensor = inverse_precip_tensor(target_sum_tensor, gm).float()
 
         return {"input": input_tensor, "target_1h": target_1h_tensor, "target_sum": target_sum_tensor}
 
@@ -490,7 +516,7 @@ def custom_loss_function(output, targets, eps=1e-8):
     """
     # 物理量制約: 負の降水は0に、NaN/Infは安全値に置換
     output = torch.nan_to_num(output, nan=0.0, posinf=1e6, neginf=0.0)
-    output = torch.relu(output).float()
+    output = torch.nn.functional.softplus(output).float()
     target_1h = torch.nan_to_num(targets['target_1h'], nan=0.0, posinf=1e6, neginf=0.0).float()
     target_sum = torch.nan_to_num(targets['target_sum'], nan=0.0, posinf=1e6, neginf=0.0).float()
     # 物理的上限のクリッピング（極端値による勾配爆発を回避）
@@ -544,7 +570,8 @@ def train_one_epoch(rank, model, dataloader, optimizer, scaler, epoch, exec_log_
     model.train()
     total_loss, total_1h_rmse, total_sum_rmse = 0.0, 0.0, 0.0
     skipped_batches = 0
-    dataloader.sampler.set_epoch(epoch)
+    if isinstance(getattr(dataloader, "sampler", None), DistributedSampler):
+        dataloader.sampler.set_epoch(epoch)
     
     with open(exec_log_path, 'a', encoding='utf-8') as log_file:
         progress_bar = tqdm(
@@ -553,8 +580,9 @@ def train_one_epoch(rank, model, dataloader, optimizer, scaler, epoch, exec_log_
             bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
         )
         for batch_idx, batch in enumerate(progress_bar):
-            inputs = batch['input'].to(rank, non_blocking=True)
-            targets = {k: v.to(rank, non_blocking=True) for k, v in batch.items() if k != 'input'}
+            dev = torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
+            inputs = batch['input'].to(dev, non_blocking=True)
+            targets = {k: v.to(dev, non_blocking=True) for k, v in batch.items() if k != 'input'}
             optimizer.zero_grad(set_to_none=True)
             
             # 入力データの健全性チェック（初期エポックのみ）
@@ -596,8 +624,10 @@ def train_one_epoch(rank, model, dataloader, optimizer, scaler, epoch, exec_log_
         if rank == 0 and skipped_batches > 0:
             progress_bar.write(f"[WARNING] Epoch {epoch+1}: Skipped {skipped_batches} batches due to non-finite loss")
             
-    avg_loss = torch.tensor([total_loss, total_1h_rmse, total_sum_rmse], device=rank) / len(dataloader)
-    dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
+    dev = torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
+    avg_loss = torch.tensor([total_loss, total_1h_rmse, total_sum_rmse], device=dev, dtype=torch.float64) / max(len(dataloader), 1)
+    if is_distributed_active():
+        dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
     return avg_loss.cpu().numpy()
 
 # -------------------- 評価ユーティリティ --------------------
@@ -667,8 +697,9 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
             bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
         )
         for batch in progress_bar:
-            inputs = batch['input'].to(rank, non_blocking=True)
-            targets = {k: v.to(rank, non_blocking=True) for k, v in batch.items() if k != 'input'}
+            dev = torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
+            inputs = batch['input'].to(dev, non_blocking=True)
+            targets = {k: v.to(dev, non_blocking=True) for k, v in batch.items() if k != 'input'}
 
             with autocast(device_type='cuda', dtype=AMP_TORCH_DTYPE):
                 outputs = model(inputs)
@@ -678,14 +709,11 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
             total_1h_rmse += loss_1h.item()
             total_sum_rmse += loss_sum.item()
 
-            # 追加: 詳細メトリクスのためのデータ（min-max逆変換＋積算一致の補正を適用）
-            outputs = torch.relu(outputs)
-            gm = load_group_minmax()
-            pred_1h_mm_t = inverse_precip_tensor(outputs.float(), gm)                             # (B,3,H,W) in mm
-            true_1h_mm_t = inverse_precip_tensor(targets['target_1h'].float(), gm)               # (B,3,H,W) in mm
-            true_sum_mm_t = inverse_precip_tensor(targets['target_sum'].float(), gm)             # (B,1,H,W) in mm
-            if ENFORCE_SUM_CONSISTENCY:
-                pred_1h_mm_t = enforce_sum_constraint_tensor(pred_1h_mm_t, true_sum_mm_t)
+            # 追加: 詳細メトリクス（Datasetでターゲットはmmに逆変換済み。出力もmmで扱う）
+            outputs = torch.nn.functional.softplus(outputs).float()
+            pred_1h_mm_t = outputs
+            true_1h_mm_t = targets['target_1h'].float()
+            true_sum_mm_t = targets['target_sum'].float()
             pred_sum_mm_t = pred_1h_mm_t.sum(dim=1, keepdim=True)                                # (B,1,H,W)
             # detach to numpy
             pred_1h = pred_1h_mm_t.detach().cpu().numpy()       # (B,3,H,W)
@@ -749,7 +777,7 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
                 progress_bar.set_postfix(loss=loss.item())
 
     # ここから分散集計（all_reduce）
-    device = torch.device(f"cuda:{rank}")
+    device = torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
     avg_loss = torch.tensor([total_loss, total_1h_rmse, total_sum_rmse], device=device, dtype=torch.float64) / len(dataloader)
 
     # CPU集計 → Torchテンソル化
@@ -765,10 +793,11 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
     t_count_sum = torch.tensor(count_sum, device=device, dtype=torch.float64)
 
     # all_reduce (SUM)
-    dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
-    for t in [t_bin_hourly, t_bin_sum, t_conf_hourly, t_conf_sum, t_wh_conf,
-              t_sse_model_1h, t_sse_base_1h, t_count_1h, t_sse_sum, t_count_sum]:
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    if is_distributed_active():
+        dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
+        for t in [t_bin_hourly, t_bin_sum, t_conf_hourly, t_conf_sum, t_wh_conf,
+                  t_sse_model_1h, t_sse_base_1h, t_count_1h, t_sse_sum, t_count_sum]:
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
     # rank0でメトリクス導出
     epoch_metrics = None
@@ -848,6 +877,49 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
 
     return avg_loss.cpu().numpy(), epoch_metrics
 
+def ensure_writable_dir(preferred_dir: str, logger=None) -> str:
+    """
+    保存先ディレクトリが書き込み可能か検査し、不可の場合はプロジェクト内ローカルまたは /tmp にフォールバックして返す。
+    優先順位:
+      1) 引数で渡された preferred_dir
+      2) プロジェクト直下: swin-unet_main_result_v5_local/result_images_monthly_v5
+      3) /tmp/swin_unet_result_images_v5
+    """
+    # 1) 第一候補: preferred_dir
+    try:
+        os.makedirs(preferred_dir, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        with tempfile.TemporaryFile(dir=preferred_dir):
+            pass
+        if logger:
+            logger.info(f"[v5] 画像保存先(検査OK): {os.path.abspath(preferred_dir)}")
+        return preferred_dir
+    except Exception:
+        if logger:
+            logger.warning(f"[v5] 画像保存先に書き込めません: {preferred_dir}. 代替パスへフォールバックします。")
+
+    # 2) プロジェクト直下ローカル
+    local_dir = Path(__file__).resolve().parent / "swin-unet_main_result_v5_local" / "result_images_monthly_v5"
+    try:
+        local_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=str(local_dir)):
+            pass
+        if logger:
+            logger.info(f"[v5] 画像保存先(ローカル代替): {os.path.abspath(str(local_dir))}")
+        return str(local_dir)
+    except Exception:
+        if logger:
+            logger.warning(f"[v5] ローカル代替パスも書き込めません: {local_dir}. /tmp にフォールバックします。")
+
+    # 3) /tmp フォールバック
+    tmp_dir = Path(tempfile.gettempdir()) / "swin_unet_result_images_v5"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    if logger:
+        logger.info(f"[v5] 画像保存先(/tmp): {os.path.abspath(str(tmp_dir))}")
+    return str(tmp_dir)
+
 # ==============================================================================
 # 6. 可視化 & プロット & 評価関数
 # ==============================================================================
@@ -873,19 +945,20 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
     # DDP安全化: 可視化はrank 0のみで実行（Cartopyの同時アクセスを回避）
     if rank != 0:
         return
-    if not CARTOPY_AVAILABLE:
+    use_cartopy = CARTOPY_AVAILABLE
+    if not use_cartopy:
         if rank == 0:
-            main_logger.warning("Cartopyが見つからないため、最終的な可視化をスキップします。")
-        return
+            main_logger.warning("Cartopyが見つからないため、地図レイヤ無しの可視化にフォールバックします。")
 
-    device = torch.device(f"cuda:{rank}")
+    device = torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
     model = SwinTransformerSys(**MODEL_ARGS).to(device)
     model.load_state_dict(torch.load(best_model_path, map_location=device))
     model.eval()
 
     if rank == 0:
-        os.makedirs(result_img_dir, exist_ok=True)
+        result_img_dir = ensure_writable_dir(result_img_dir, main_logger)
         main_logger.info(f"[v5] 検証データ全体に対する可視化を開始 (モデル: {os.path.basename(best_model_path)})")
+        main_logger.info(f"[v5] 画像保存先(最終決定): {os.path.abspath(result_img_dir)}")
     
     # rank 0のみで全インデックスを処理
     proc_indices = list(range(len(valid_dataset)))
@@ -907,9 +980,25 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             target_1h = sample['target_1h']  # (3, H, W)
             target_sum = target_1h.sum(dim=0, keepdim=False)  # (H, W)
 
-            with autocast(device_type='cuda', dtype=AMP_TORCH_DTYPE):
-                output = model(inputs)
-            output = torch.relu(output).squeeze(0)  # (3, H, W) on device
+            ctx = autocast(device_type='cuda', dtype=AMP_TORCH_DTYPE) if device.type == 'cuda' else nullcontext()
+            try:
+                with ctx:
+                    output = model(inputs)
+            except RuntimeError as e:
+                # 例: "no kernel image is available for execution on the device" 等のCUDA実行エラー時はCPUへフォールバック
+                if device.type == 'cuda':
+                    if main_logger:
+                        main_logger.warning(f"CUDA実行でエラーが発生したためCPUにフォールバックします: {e}")
+                    device = torch.device('cpu')
+                    model = model.to(device)
+                    inputs = inputs.to(device)
+                    with nullcontext():
+                        output = model(inputs)
+                else:
+                    raise
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+            output = torch.nn.functional.softplus(output).squeeze(0)  # (3, H, W) on device
 
             # min-max逆変換 + 積算一致補正（描画はmmスケールで統一）
             gm = load_group_minmax()
@@ -940,23 +1029,43 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             cmap.set_under(alpha=0)
             vmin_val = max(LOGNORM_VMIN_MM, 1e-6)
 
-            # vmaxは外れ値に影響されにくいように8枚の99パーセンタイルで決定
-            stack_vals = torch.stack([
-                pred_sum,
-                target_sum_mm,
-                pred_3[0], pred_3[1], pred_3[2],
-                tgt_3[0], tgt_3[1], tgt_3[2]
-            ], dim=0).numpy()
-            flat = stack_vals.reshape(8, -1)
+            # vmaxは外れ値に影響されにくいように、各2Dパネルの正の画素の99パーセンタイルで決定
+            # 入力の次元が (3,H,W) や (1,H,W) になっていても、(H,W) に正規化してから集計する
+            def _to2d_tensor(t):
+                tt = t
+                if isinstance(tt, np.ndarray):
+                    tt = torch.from_numpy(tt)
+                if isinstance(tt, torch.Tensor):
+                    tt = tt.detach().cpu()
+                    if tt.dim() == 3:
+                        # (C,H,W) → (H,W)
+                        if tt.shape[0] == 1:
+                            tt = tt.squeeze(0)
+                        elif tt.shape[0] == 3:
+                            # 3時間の積算など、3chは和で代表化
+                            tt = tt.sum(dim=0)
+                        else:
+                            # 想定外のチャネル数は先頭チャネルを使用
+                            tt = tt[0]
+                return tt
+
+            panels_2d = [
+                _to2d_tensor(pred_3.sum(dim=0)),  # 予測積算（安全に2D化）
+                _to2d_tensor(target_sum_mm),       # 正解積算
+                _to2d_tensor(pred_3[0]), _to2d_tensor(pred_3[1]), _to2d_tensor(pred_3[2]),
+                _to2d_tensor(tgt_3[0]),  _to2d_tensor(tgt_3[1]),  _to2d_tensor(tgt_3[2]),
+            ]
+            flat = torch.cat([p.reshape(-1) for p in panels_2d])
             flat_pos = flat[flat > 0.0]
-            vmax_val = np.percentile(flat_pos, 99) if flat_pos.size > 0 else vmin_val * 10.0
+            vmax_val = np.percentile(flat_pos.numpy(), 99) if flat_pos.numel() > 0 else vmin_val * 10.0
             if vmax_val <= vmin_val:
                 vmax_val = vmin_val * 10.0
 
             norm = LogNorm(vmin=vmin_val, vmax=vmax_val)
 
             # 2行4列の図: 上段(予測: 積算, ft+4, ft+5, ft+6) 下段(正解: 積算, ft+4, ft+5, ft+6)
-            fig, axes = plt.subplots(2, 4, figsize=(24, 12), subplot_kw={'projection': ccrs.PlateCarree()})
+            proj_kw = {'projection': ccrs.PlateCarree()} if use_cartopy else {}
+            fig, axes = plt.subplots(2, 4, figsize=(24, 12), subplot_kw=proj_kw)
             time_val = valid_dataset.get_time(idx)
             fig.suptitle(f"Validation Time: {np.datetime_as_string(time_val, unit='m')}", fontsize=16)
 
@@ -971,14 +1080,30 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             ]
 
             for i, ax in enumerate(axes.flat):
-                ax.set_extent(map_extent, crs=ccrs.PlateCarree())
-                ax.add_feature(cfeature.COASTLINE, edgecolor='black')
-                ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='black')
-                gl = ax.gridlines(draw_labels=True, dms=True, x_inline=False, y_inline=False, color='gray', alpha=0.5)
-                gl.top_labels = False
-                gl.right_labels = False
-                
-                im = ax.imshow(plot_data[i], extent=map_extent, origin='upper', cmap=cmap, norm=norm)
+                # 安全化: imshowに渡す配列は2D(H,W)に強制する
+                img = plot_data[i]
+                arr2d = img if isinstance(img, np.ndarray) else np.array(img)
+                if arr2d.ndim == 3:
+                    # 想定外に (C,H,W) が来た場合は2D化
+                    if arr2d.shape[0] == 1:
+                        arr2d = arr2d[0]
+                    elif arr2d.shape[0] == 3:
+                        # 3chの場合は和で代表化（本来は事前に2Dへ整形済みだが保険）
+                        arr2d = arr2d.sum(axis=0)
+                    else:
+                        # 最初のチャネルのみを使用
+                        arr2d = arr2d[0]
+
+                if use_cartopy:
+                    ax.set_extent(map_extent, crs=ccrs.PlateCarree())
+                    ax.add_feature(cfeature.COASTLINE, edgecolor='black')
+                    ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='black')
+                    gl = ax.gridlines(draw_labels=True, dms=True, x_inline=False, y_inline=False, color='gray', alpha=0.5)
+                    gl.top_labels = False
+                    gl.right_labels = False
+                    im = ax.imshow(arr2d, extent=map_extent, origin='upper', cmap=cmap, norm=norm)
+                else:
+                    im = ax.imshow(arr2d, origin='upper', cmap=cmap, norm=norm)
                 ax.set_title(titles[i])
                 fig.colorbar(im, ax=ax, shrink=0.7, label='Precipitation (mm) [Log scale]')
 
@@ -991,15 +1116,33 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
                 if main_logger:
                     main_logger.warning(f"Cartopy描画でエラーが発生したため、地図レイヤを外して保存を再試行します: {e}")
                 plt.close(fig)
-                # フォールバック: Cartopyを使わない通常のAxesで再描画
+                # フォールバック: Cartopyを使わない通常のAxesで再描画（imshowへは2D配列を渡す）
                 fig2, axes2 = plt.subplots(2, 4, figsize=(24, 12))
                 fig2.suptitle(f"Validation Time: {np.datetime_as_string(time_val, unit='m')}", fontsize=16)
                 for i, ax2 in enumerate(axes2.flat):
-                    im2 = ax2.imshow(plot_data[i], origin='upper', cmap=cmap, norm=norm)
+                    img2 = plot_data[i]
+                    arr2d2 = img2 if isinstance(img2, np.ndarray) else np.array(img2)
+                    if arr2d2.ndim == 3:
+                        if arr2d2.shape[0] == 1:
+                            arr2d2 = arr2d2[0]
+                        elif arr2d2.shape[0] == 3:
+                            arr2d2 = arr2d2.sum(axis=0)
+                        else:
+                            arr2d2 = arr2d2[0]
+                    im2 = ax2.imshow(arr2d2, origin='upper', cmap=cmap, norm=norm)
                     ax2.set_title(titles[i])
                     fig2.colorbar(im2, ax=ax2, shrink=0.7, label='Precipitation (mm) [Log scale]')
                 plt.tight_layout(rect=[0, 0.03, 1, 0.96])
-                plt.savefig(save_path, dpi=150)
+                try:
+                    plt.savefig(save_path, dpi=150)
+                except PermissionError:
+                    # 書き込み権限が無い場合はフォールバック先ディレクトリに保存
+                    alt_dir = os.path.join(result_img_dir, "fallback_write")
+                    os.makedirs(alt_dir, exist_ok=True)
+                    alt_path = os.path.join(alt_dir, os.path.basename(save_path))
+                    if main_logger:
+                        main_logger.warning(f"Permission denied for '{save_path}'. Fallback save to '{alt_path}'.")
+                    plt.savefig(alt_path, dpi=150)
                 plt.close(fig2)
             else:
                 plt.close(fig)
@@ -1226,15 +1369,12 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
 
         with autocast(device_type='cuda', dtype=AMP_TORCH_DTYPE):
             outputs = model(inputs)
-        outputs = torch.relu(outputs)
+        outputs = torch.nn.functional.softplus(outputs).float()
 
-        # min-max逆変換 + 積算一致補正（評価用はmmスケールで実施）
-        gm = load_group_minmax()
-        pred_1h_mm_t = inverse_precip_tensor(outputs.float(), gm)                   # (B,3,H,W)
-        true_1h_mm_t = inverse_precip_tensor(targ_1h.float(), gm)                  # (B,3,H,W)
-        true_sum_mm_t = inverse_precip_tensor(targ_sum.float(), gm)                # (B,1,H,W)
-        if ENFORCE_SUM_CONSISTENCY:
-            pred_1h_mm_t = enforce_sum_constraint_tensor(pred_1h_mm_t, true_sum_mm_t)
+        # Datasetでターゲットはmmに逆変換済み。出力もmmとして扱う（評価では積算一致補正は適用しない）
+        pred_1h_mm_t = outputs
+        true_1h_mm_t = targ_1h.float()
+        true_sum_mm_t = targ_sum.float()
         pred_sum_mm_t = pred_1h_mm_t.sum(dim=1, keepdim=True)
 
         # numpyへ
@@ -1447,7 +1587,9 @@ def main_worker(rank, world_size, train_files, valid_files):
         なし
     """
     set_seed(RANDOM_SEED)
-    setup_ddp(rank, world_size)
+    if world_size > 1:
+        setup_ddp(rank, world_size)
+    dev = torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
     
     main_log = None
     exec_log_path = EXEC_LOG_PATH
@@ -1467,14 +1609,20 @@ def main_worker(rank, world_size, train_files, valid_files):
     train_dataset = NetCDFDataset(train_files, logger=(main_log if rank == 0 else None))
     valid_dataset = NetCDFDataset(valid_files, logger=(main_log if rank == 0 else None))
     
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True, sampler=train_sampler)
+    if world_size > 1:
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available(), sampler=train_sampler)
+        valid_sampler = DistributedSampler(valid_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available(), sampler=valid_sampler)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
+        valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
     
-    valid_sampler = DistributedSampler(valid_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-    valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True, sampler=valid_sampler)
-    
-    model = SwinTransformerSys(**MODEL_ARGS).to(rank)
-    model = DDP(model, device_ids=[rank], find_unused_parameters=False)
+    if world_size > 1:
+        model = SwinTransformerSys(**MODEL_ARGS).to(rank)
+        model = DDP(model, device_ids=[rank], find_unused_parameters=False)
+    else:
+        model = SwinTransformerSys(**MODEL_ARGS).to(dev)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * world_size)
     # fp16 のみ GradScaler を有効化（bf16は不要）
@@ -1539,10 +1687,12 @@ def main_worker(rank, world_size, train_files, valid_files):
             if val_losses[0] < best_val_loss:
                 best_val_loss = val_losses[0]
                 best_epoch = epoch + 1
-                torch.save(model.module.state_dict(), MODEL_SAVE_PATH)
+                state_dict = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
+                torch.save(state_dict, MODEL_SAVE_PATH)
                 main_log.info(f"Saved best model at epoch {best_epoch} with validation (weighted) loss: {best_val_loss:.4f}")
     
-    dist.barrier()
+    if is_distributed_active():
+        dist.barrier()
 
     if rank == 0:
         main_log.info("\nTraining finished.")
@@ -1553,7 +1703,8 @@ def main_worker(rank, world_size, train_files, valid_files):
         if rank == 0 and main_log:
             main_log.error(f"visualize_final_results で例外が発生しました。可視化をスキップして後続処理を継続します: {e}", exc_info=True)
     
-    dist.barrier()
+    if is_distributed_active():
+        dist.barrier()
 
     if rank == 0:
         # 既存の損失曲線
@@ -1561,7 +1712,7 @@ def main_worker(rank, world_size, train_files, valid_files):
         # 追加: エポックメトリクスの図
         plot_epoch_metrics(metric_history, EPOCH_METRIC_PLOT_DIR, main_log)
         # v5: 拡張評価（最終モデル）
-        evaluate_model(MODEL_SAVE_PATH, valid_dataset, torch.device(f"cuda:{rank}"), EVALUATION_LOG_PATH, main_log)
+        evaluate_model(MODEL_SAVE_PATH, valid_dataset, dev, EVALUATION_LOG_PATH, main_log)
         # v5: 画像→動画化
         create_video_from_images(RESULT_IMG_DIR, VIDEO_OUTPUT_PATH, VIDEO_FPS, main_log)
 
@@ -1614,10 +1765,15 @@ if __name__ == '__main__':
         world_size = torch.cuda.device_count()
         if world_size > 1:
             main_logger.info(f"{world_size}個のGPUを検出。DDPを開始します。")
-            mp.spawn(main_worker,
-                     args=(world_size, train_files, valid_files),
-                     nprocs=world_size,
-                     join=True)
+            try:
+                mp.spawn(main_worker,
+                         args=(world_size, train_files, valid_files),
+                         nprocs=world_size,
+                         join=True)
+            except Exception as e:
+                main_logger.error(f"DDP 実行中にエラーが発生しました: {e}")
+                main_logger.warning("DDPをスキップしてシングルGPUモードで継続します。")
+                main_worker(0, 1, train_files, valid_files)
         elif world_size == 1:
             main_logger.info("1個のGPUを検出。シングルGPUモードで実行します。")
             main_worker(0, 1, train_files, valid_files)

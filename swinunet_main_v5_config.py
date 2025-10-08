@@ -48,7 +48,7 @@ CFG = {
 
     "PATHS": {
         # データ/結果ルート
-        "data_dir": "./output_nc",
+        "data_dir": "./optimization_nc",
         "result_dir": "swin-unet_main_result_v5",
 
         # 生成ファイル（result_dir配下）
@@ -91,7 +91,7 @@ CFG = {
         "pin_memory": True,
     },
     "TRAINING": {
-        "epochs": 60,
+        "epochs": 5,
         "amp_dtype": "bf16",      # "fp16" もしくは "bf16" - bf16は数値安定性が高い
         "use_grad_scaler": True,
         "ddp_find_unused_parameters": False,
@@ -184,19 +184,21 @@ try:
 except Exception:
     pass
 
-# パス類
-RESULT_DIR = CFG["PATHS"]["result_dir"]
-MODEL_SAVE_PATH = os.path.join(RESULT_DIR, CFG["PATHS"]["model_save_name"])
-PLOT_SAVE_PATH = os.path.join(RESULT_DIR, CFG["PATHS"]["plot_save_name"])
-RESULT_IMG_DIR = os.path.join(RESULT_DIR, CFG["PATHS"]["result_img_dir_name"])
-MAIN_LOG_PATH = os.path.join(RESULT_DIR, CFG["PATHS"]["main_log_name"])
-EXEC_LOG_PATH = os.path.join(RESULT_DIR, CFG["PATHS"]["exec_log_name"])
-EVALUATION_LOG_PATH = os.path.join(RESULT_DIR, CFG["PATHS"]["evaluation_log_name"])
-EPOCH_METRIC_PLOT_DIR = os.path.join(RESULT_DIR, CFG["PATHS"]["epoch_metric_plot_dir_name"])
-VIDEO_OUTPUT_PATH = os.path.join(RESULT_DIR, CFG["PATHS"]["video_name"])
+# パス類（この設定ファイルの場所を基準に絶対パスへ解決）
+BASE_DIR = Path(__file__).parent.resolve()
+RESULT_DIR = str((BASE_DIR / CFG["PATHS"]["result_dir"]).resolve())
+MODEL_SAVE_PATH = str((Path(RESULT_DIR) / CFG["PATHS"]["model_save_name"]).resolve())
+PLOT_SAVE_PATH = str((Path(RESULT_DIR) / CFG["PATHS"]["plot_save_name"]).resolve())
+RESULT_IMG_DIR = str((Path(RESULT_DIR) / CFG["PATHS"]["result_img_dir_name"]).resolve())
+MAIN_LOG_PATH = str((Path(RESULT_DIR) / CFG["PATHS"]["main_log_name"]).resolve())
+EXEC_LOG_PATH = str((Path(RESULT_DIR) / CFG["PATHS"]["exec_log_name"]).resolve())
+EVALUATION_LOG_PATH = str((Path(RESULT_DIR) / CFG["PATHS"]["evaluation_log_name"]).resolve())
+EPOCH_METRIC_PLOT_DIR = str((Path(RESULT_DIR) / CFG["PATHS"]["epoch_metric_plot_dir_name"]).resolve())
+VIDEO_OUTPUT_PATH = str((Path(RESULT_DIR) / CFG["PATHS"]["video_name"]).resolve())
 
 # データ仕様
-DATA_DIR = CFG["PATHS"]["data_dir"]
+# データディレクトリもこの設定ファイルの場所基準で解決
+DATA_DIR = str((BASE_DIR / CFG["PATHS"]["data_dir"]).resolve())
 TRAIN_YEARS = list(CFG["DATA"]["train_years"])
 VALID_YEARS = list(CFG["DATA"]["valid_years"])
 IMG_SIZE = int(CFG["DATA"]["img_size"])
