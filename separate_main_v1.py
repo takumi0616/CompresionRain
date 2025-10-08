@@ -1093,7 +1093,20 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             ratios = ratios / ratios.sum(dim=1, keepdim=True).clamp_min(EPS)
             S = sample['target_sum'].unsqueeze(0).to(device)  # (1,1,H,W)
             pred_1h = (ratios * S).squeeze(0).detach().cpu()  # (3, H, W)
-            pred_sum = pred_1h.sum(dim=0)  # (H, W)
+            # 安全化: チャネル数が3未満でも可視化が落ちないようにゼロ埋めで3chに揃える
+            # t: (C,H,W) or (H,W) -> (3,H,W)
+            def _ensure_three_channels(t: torch.Tensor) -> torch.Tensor:
+                if t.dim() == 2:
+                    t = t.unsqueeze(0)
+                C = t.shape[0]
+                if C >= 3:
+                    return t[:3]
+                pads = [t.new_zeros((1, *t.shape[1:])) for _ in range(3 - C)]
+                return torch.cat([t, *pads], dim=0)
+
+            pred_3 = _ensure_three_channels(pred_1h)     # (3,H,W)
+            tgt_3  = _ensure_three_channels(target_1h)   # (3,H,W)
+            pred_sum = pred_3.sum(dim=0)  # (H, W)
 
             # 対数色スケール設定 (LogNorm)
             cmap = plt.get_cmap("Blues")
@@ -1104,8 +1117,8 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             stack_vals = torch.stack([
                 pred_sum,
                 target_sum,
-                pred_1h[0], pred_1h[1], pred_1h[2],
-                target_1h[0], target_1h[1], target_1h[2]
+                pred_3[0], pred_3[1], pred_3[2],
+                tgt_3[0], tgt_3[1], tgt_3[2]
             ], dim=0).numpy()
             flat = stack_vals.reshape(8, -1)
             flat_pos = flat[flat > 0.0]
@@ -1120,9 +1133,10 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
             time_val = valid_dataset.get_time(idx)
             fig.suptitle(f"Validation Time: {np.datetime_as_string(time_val, unit='m')}", fontsize=16)
 
+            # 可視化配列（pred/gt とも安全に3ch化したテンソルを使用）
             plot_data = [
-                pred_sum.numpy(), pred_1h[0].numpy(), pred_1h[1].numpy(), pred_1h[2].numpy(),
-                target_sum.numpy(), target_1h[0].numpy(), target_1h[1].numpy(), target_1h[2].numpy()
+                pred_sum.numpy(), pred_3[0].numpy(), pred_3[1].numpy(), pred_3[2].numpy(),
+                target_sum.numpy(), tgt_3[0].numpy(), tgt_3[1].numpy(), tgt_3[2].numpy()
             ]
             titles = [
                 'Prediction Accum (4-6h sum)', 'Prediction FT+4', 'Prediction FT+5', 'Prediction FT+6',
@@ -1687,7 +1701,12 @@ def main_worker(rank, world_size, train_files, valid_files):
     if rank == 0:
         main_log.info("\nTraining finished.")
         
-    visualize_final_results(rank, world_size, valid_dataset, MODEL_SAVE_PATH, RESULT_IMG_DIR, main_log, exec_log_path)
+    # 可視化は rank0 のみ実行。例外時も学習終了処理まで到達できるように防御
+    try:
+        visualize_final_results(rank, world_size, valid_dataset, MODEL_SAVE_PATH, RESULT_IMG_DIR, main_log, exec_log_path)
+    except Exception as e:
+        if rank == 0 and main_log:
+            main_log.error(f"[ratio] visualize_final_results で例外が発生しました。可視化をスキップして後続処理を継続します: {e}", exc_info=True)
     
     dist.barrier()
 
