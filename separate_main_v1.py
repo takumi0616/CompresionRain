@@ -112,7 +112,7 @@ NUM_WORKERS = 4
 
 # --- 学習パラメータ ---
 BATCH_SIZE = 8
-NUM_EPOCHS = 50
+NUM_EPOCHS = 3
 LEARNING_RATE = 1e-4
 
 # --- 再現性確保のための乱数シード設定 ---
