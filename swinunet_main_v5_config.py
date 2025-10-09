@@ -44,7 +44,7 @@ swinunet_main_v5_config.py
 # ======================================
 CFG = {
     "SEED": 1,            # 乱数シード
-    "THREADS": 4,         # 数値計算スレッド数 (必要なら使用)
+    "THREADS": 8,         # 数値計算スレッド数 (必要なら使用)
 
     "PATHS": {
         # データ/結果ルート
@@ -88,11 +88,11 @@ CFG = {
     # 学習/Loader
     "DATALOADER": {
         "batch_size": 8,
-        "num_workers": 4,
+        "num_workers": 8,
         "pin_memory": True,
     },
     "TRAINING": {
-        "epochs": 2,
+        "epochs": 20,
         "amp_dtype": "bf16",      # "fp16" もしくは "bf16" - bf16は数値安定性が高い
         "use_grad_scaler": True,
         "ddp_find_unused_parameters": False,
