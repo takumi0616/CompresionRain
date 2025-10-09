@@ -576,7 +576,7 @@ def train_one_epoch(rank, model, dataloader, optimizer, scaler, epoch, exec_log_
     with open(exec_log_path, 'a', encoding='utf-8') as log_file:
         progress_bar = tqdm(
             dataloader, desc=f"Train Epoch {epoch+1}", disable=(rank != 0), 
-            leave=True, file=log_file,
+            leave=True, file=log_file, mininterval=1.0,
             bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
         )
         for batch_idx, batch in enumerate(progress_bar):
@@ -693,7 +693,7 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
     with open(exec_log_path, 'a', encoding='utf-8') as log_file:
         progress_bar = tqdm(
             dataloader, desc=f"Valid Epoch {epoch+1}", disable=(rank != 0),
-            leave=True, file=log_file,
+            leave=True, file=log_file, mininterval=1.0,
             bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
         )
         for batch in progress_bar:
@@ -1676,15 +1676,30 @@ def main_worker(rank, world_size, train_files, valid_files):
     
     train_dataset = NetCDFDataset(train_files, logger=(main_log if rank == 0 else None))
     valid_dataset = NetCDFDataset(valid_files, logger=(main_log if rank == 0 else None))
+
+    # DataLoader最適化（prefetch/persistent をCFGから受け取り適用）
+    dl_cfg = CFG.get("DATALOADER", {})
+    dl_extra = {}
+    if 'prefetch_factor' in dl_cfg:
+        try:
+            dl_extra['prefetch_factor'] = int(dl_cfg['prefetch_factor'])
+        except Exception:
+            pass
+    if 'persistent_workers' in dl_cfg and NUM_WORKERS > 0:
+        try:
+            dl_extra['persistent_workers'] = bool(dl_cfg['persistent_workers'])
+        except Exception:
+            pass
+    pin_mem = torch.cuda.is_available()
     
     if world_size > 1:
         train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available(), sampler=train_sampler)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=pin_mem, sampler=train_sampler, **dl_extra)
         valid_sampler = DistributedSampler(valid_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-        valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available(), sampler=valid_sampler)
+        valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=pin_mem, sampler=valid_sampler, **dl_extra)
     else:
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
-        valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=pin_mem, **dl_extra)
+        valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=pin_mem, **dl_extra)
     
     if world_size > 1:
         model = SwinTransformerSys(**MODEL_ARGS).to(rank)
