@@ -87,12 +87,12 @@ CFG = {
 
     # 学習/Loader
     "DATALOADER": {
-        "batch_size": 8,
-        "num_workers": 8,
+        "batch_size": 16,
+        "num_workers": 4,
         "pin_memory": True,
     },
     "TRAINING": {
-        "epochs": 50,
+        "epochs": 15,
         "amp_dtype": "bf16",      # "fp16" もしくは "bf16" - bf16は数値安定性が高い
         "use_grad_scaler": True,
         "ddp_find_unused_parameters": False,
@@ -113,11 +113,10 @@ CFG = {
 
     # モデル（Swin U-Net 系）
     "MODEL": {
-        # embed_dim/headsなどは自由に変更可（例: embed_dim=128, heads=[4,8,16,32]）
         "embed_dim": 128,
         "depths": [2, 2, 12, 2],
         "num_heads": [4, 8, 16, 32],
-        "window_size": 15,
+        "window_size": 5,
         "mlp_ratio": 4.0,
         "qkv_bias": True,
         "drop_rate": 0.0,
