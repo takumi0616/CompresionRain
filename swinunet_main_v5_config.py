@@ -87,11 +87,9 @@ CFG = {
 
     # 学習/Loader
     "DATALOADER": {
-        "batch_size": 12,
-        "num_workers": 16,
+        "batch_size": 16,
+        "num_workers": 4,
         "pin_memory": True,
-        "prefetch_factor": 8,
-        "persistent_workers": True
     },
     "TRAINING": {
         "epochs": 15,
