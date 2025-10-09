@@ -14,7 +14,7 @@ import glob
 import warnings
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
-from matplotlib.colors import LogNorm
+from matplotlib.colors import LogNorm, Normalize
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -26,7 +26,7 @@ from torch.amp import GradScaler, autocast
 from swinunet_main_v5_config import (
     CFG, SEED,
     DATA_DIR, TRAIN_YEARS, VALID_YEARS,
-    RESULT_DIR, MODEL_SAVE_PATH, PLOT_SAVE_PATH, RESULT_IMG_DIR,
+    RESULT_DIR, MODEL_SAVE_PATH, PLOT_SAVE_PATH, RESULT_IMG_DIR, RESULT_IMG_DIR_RN,
     MAIN_LOG_PATH, EXEC_LOG_PATH, EVALUATION_LOG_PATH, EPOCH_METRIC_PLOT_DIR,
     VIDEO_OUTPUT_PATH, VIDEO_FPS,
     NUM_WORKERS, BATCH_SIZE, NUM_EPOCHS, LEARNING_RATE,
@@ -882,8 +882,8 @@ def ensure_writable_dir(preferred_dir: str, logger=None) -> str:
     保存先ディレクトリが書き込み可能か検査し、不可の場合はプロジェクト内ローカルまたは /tmp にフォールバックして返す。
     優先順位:
       1) 引数で渡された preferred_dir
-      2) プロジェクト直下: swin-unet_main_result_v5_local/result_images_monthly_v5
-      3) /tmp/swin_unet_result_images_v5
+      2) プロジェクト直下: swin-unet_main_result_v5_local/<leaf>
+      3) /tmp/swin_unet_result_images_v5_<leaf>
     """
     # 1) 第一候補: preferred_dir
     try:
@@ -901,7 +901,8 @@ def ensure_writable_dir(preferred_dir: str, logger=None) -> str:
             logger.warning(f"[v5] 画像保存先に書き込めません: {preferred_dir}. 代替パスへフォールバックします。")
 
     # 2) プロジェクト直下ローカル
-    local_dir = Path(__file__).resolve().parent / "swin-unet_main_result_v5_local" / "result_images_monthly_v5"
+    leaf = Path(preferred_dir).name
+    local_dir = Path(__file__).resolve().parent / "swin-unet_main_result_v5_local" / leaf
     try:
         local_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryFile(dir=str(local_dir)):
@@ -914,7 +915,7 @@ def ensure_writable_dir(preferred_dir: str, logger=None) -> str:
             logger.warning(f"[v5] ローカル代替パスも書き込めません: {local_dir}. /tmp にフォールバックします。")
 
     # 3) /tmp フォールバック
-    tmp_dir = Path(tempfile.gettempdir()) / "swin_unet_result_images_v5"
+    tmp_dir = Path(tempfile.gettempdir()) / f"swin_unet_result_images_v5_{leaf}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     if logger:
         logger.info(f"[v5] 画像保存先(/tmp): {os.path.abspath(str(tmp_dir))}")
@@ -924,7 +925,7 @@ def ensure_writable_dir(preferred_dir: str, logger=None) -> str:
 # 6. 可視化 & プロット & 評価関数
 # ==============================================================================
 @torch.no_grad()
-def visualize_final_results(rank, world_size, valid_dataset, best_model_path, result_img_dir, main_logger, exec_log_path):
+def visualize_final_results(rank, world_size, valid_dataset, best_model_path, result_img_dir, result_img_dir_rn, main_logger, exec_log_path):
     """
     概要:
         最良モデルを用いて検証データ全体を可視化する。2x4 パネル（予測:積算/ft4/5/6、正解:同）で PNG を保存。
@@ -957,8 +958,10 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
 
     if rank == 0:
         result_img_dir = ensure_writable_dir(result_img_dir, main_logger)
+        result_img_dir_rn = ensure_writable_dir(result_img_dir_rn, main_logger)
         main_logger.info(f"[v5] 検証データ全体に対する可視化を開始 (モデル: {os.path.basename(best_model_path)})")
         main_logger.info(f"[v5] 画像保存先(最終決定): {os.path.abspath(result_img_dir)}")
+        main_logger.info(f"[v5] 画像保存先(最終決定, RN): {os.path.abspath(result_img_dir_rn)}")
     
     # rank 0のみで全インデックスを処理
     proc_indices = list(range(len(valid_dataset)))
@@ -1146,6 +1149,71 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
                 plt.close(fig2)
             else:
                 plt.close(fig)
+            
+            # 追加: 線形スケール版（0-600mm）を RN ディレクトリへ出力
+            norm_lin = Normalize(vmin=0.0, vmax=600.0)
+            proj_kw = {'projection': ccrs.PlateCarree()} if use_cartopy else {}
+            figL, axesL = plt.subplots(2, 4, figsize=(24, 12), subplot_kw=proj_kw)
+            figL.suptitle(f"Validation Time: {np.datetime_as_string(time_val, unit='m')}", fontsize=16)
+            for i, axL in enumerate(axesL.flat):
+                imgL = plot_data[i]
+                arr2dL = imgL if isinstance(imgL, np.ndarray) else np.array(imgL)
+                if arr2dL.ndim == 3:
+                    if arr2dL.shape[0] == 1:
+                        arr2dL = arr2dL[0]
+                    elif arr2dL.shape[0] == 3:
+                        arr2dL = arr2dL.sum(axis=0)
+                    else:
+                        arr2dL = arr2dL[0]
+                if use_cartopy:
+                    axL.set_extent(map_extent, crs=ccrs.PlateCarree())
+                    axL.add_feature(cfeature.COASTLINE, edgecolor='black')
+                    axL.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='black')
+                    glL = axL.gridlines(draw_labels=True, dms=True, x_inline=False, y_inline=False, color='gray', alpha=0.5)
+                    glL.top_labels = False
+                    glL.right_labels = False
+                    imL = axL.imshow(arr2dL, extent=map_extent, origin='upper', cmap=cmap, norm=norm_lin)
+                else:
+                    imL = axL.imshow(arr2dL, origin='upper', cmap=cmap, norm=norm_lin)
+                axL.set_title(titles[i])
+                figL.colorbar(imL, ax=axL, shrink=0.7, label='Precipitation (mm) [Linear 0-600]')
+            plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+            save_path_rn = os.path.join(result_img_dir_rn, f'validation_{time_str}.png')
+            try:
+                plt.savefig(save_path_rn, dpi=150)
+            except Exception as e:
+                if main_logger:
+                    main_logger.warning(f"Cartopy描画（RN版）でエラーが発生したため、地図レイヤを外して保存を再試行します: {e}")
+                plt.close(figL)
+                # フォールバック: 通常Axesで再描画
+                fig2L, axes2L = plt.subplots(2, 4, figsize=(24, 12))
+                fig2L.suptitle(f"Validation Time: {np.datetime_as_string(time_val, unit='m')}", fontsize=16)
+                for i, ax2L in enumerate(axes2L.flat):
+                    img2L = plot_data[i]
+                    arr2d2L = img2L if isinstance(img2L, np.ndarray) else np.array(img2L)
+                    if arr2d2L.ndim == 3:
+                        if arr2d2L.shape[0] == 1:
+                            arr2d2L = arr2d2L[0]
+                        elif arr2d2L.shape[0] == 3:
+                            arr2d2L = arr2d2L.sum(axis=0)
+                        else:
+                            arr2d2L = arr2d2L[0]
+                    im2L = ax2L.imshow(arr2d2L, origin='upper', cmap=cmap, norm=norm_lin)
+                    ax2L.set_title(titles[i])
+                    fig2L.colorbar(im2L, ax=ax2L, shrink=0.7, label='Precipitation (mm) [Linear 0-600]')
+                plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+                try:
+                    plt.savefig(save_path_rn, dpi=150)
+                except PermissionError:
+                    alt_dirL = os.path.join(result_img_dir_rn, "fallback_write")
+                    os.makedirs(alt_dirL, exist_ok=True)
+                    alt_pathL = os.path.join(alt_dirL, os.path.basename(save_path_rn))
+                    if main_logger:
+                        main_logger.warning(f"Permission denied for '{save_path_rn}'. Fallback save to '{alt_pathL}'.")
+                    plt.savefig(alt_pathL, dpi=150)
+                plt.close(fig2L)
+            else:
+                plt.close(figL)
 
 def plot_loss_curve(history, save_path, logger, best_epoch):
     """
@@ -1700,7 +1768,7 @@ def main_worker(rank, world_size, train_files, valid_files):
         evaluate_model(MODEL_SAVE_PATH, valid_dataset, dev, EVALUATION_LOG_PATH, main_log)
         
     try:
-        visualize_final_results(rank, world_size, valid_dataset, MODEL_SAVE_PATH, RESULT_IMG_DIR, main_log, exec_log_path)
+        visualize_final_results(rank, world_size, valid_dataset, MODEL_SAVE_PATH, RESULT_IMG_DIR, RESULT_IMG_DIR_RN, main_log, exec_log_path)
     except Exception as e:
         if rank == 0 and main_log:
             main_log.error(f"visualize_final_results で例外が発生しました。可視化をスキップして後続処理を継続します: {e}", exc_info=True)
@@ -1717,6 +1785,7 @@ def main_worker(rank, world_size, train_files, valid_files):
         create_video_from_images(RESULT_IMG_DIR, VIDEO_OUTPUT_PATH, VIDEO_FPS, main_log)
 
         main_log.info(f"Result images saved in '{RESULT_IMG_DIR}/'.")
+        main_log.info(f"Result images (RN, linear 0-600mm) saved in '{RESULT_IMG_DIR_RN}/'.")
         main_log.info(f"Epoch metrics plots saved in '{EPOCH_METRIC_PLOT_DIR}/'.")
         if IMAGEIO_AVAILABLE:
             main_log.info(f"Validation video saved to '{VIDEO_OUTPUT_PATH}'.")

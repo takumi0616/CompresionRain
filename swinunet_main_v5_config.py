@@ -55,6 +55,7 @@ CFG = {
         "model_save_name": "best_swin_unet_model_ddp_monthly_v5.pth",
         "plot_save_name": "loss_curve_monthly_v5.png",
         "result_img_dir_name": "result_images_monthly_v5",
+        "result_img_dir_name_rn": "result_images_monthly_RN_v5",
         "main_log_name": "main_v5.log",
         "exec_log_name": "execution_v5.log",
         "evaluation_log_name": "evaluation_v5.log",
@@ -190,6 +191,7 @@ RESULT_DIR = str((BASE_DIR / CFG["PATHS"]["result_dir"]).resolve())
 MODEL_SAVE_PATH = str((Path(RESULT_DIR) / CFG["PATHS"]["model_save_name"]).resolve())
 PLOT_SAVE_PATH = str((Path(RESULT_DIR) / CFG["PATHS"]["plot_save_name"]).resolve())
 RESULT_IMG_DIR = str((Path(RESULT_DIR) / CFG["PATHS"]["result_img_dir_name"]).resolve())
+RESULT_IMG_DIR_RN = str((Path(RESULT_DIR) / CFG["PATHS"]["result_img_dir_name_rn"]).resolve())
 MAIN_LOG_PATH = str((Path(RESULT_DIR) / CFG["PATHS"]["main_log_name"]).resolve())
 EXEC_LOG_PATH = str((Path(RESULT_DIR) / CFG["PATHS"]["exec_log_name"]).resolve())
 EVALUATION_LOG_PATH = str((Path(RESULT_DIR) / CFG["PATHS"]["evaluation_log_name"]).resolve())
@@ -292,7 +294,7 @@ __all__ = [
     "SEED",
 
     # Paths (derived)
-    "RESULT_DIR", "MODEL_SAVE_PATH", "PLOT_SAVE_PATH", "RESULT_IMG_DIR",
+    "RESULT_DIR", "MODEL_SAVE_PATH", "PLOT_SAVE_PATH", "RESULT_IMG_DIR", "RESULT_IMG_DIR_RN",
     "MAIN_LOG_PATH", "EXEC_LOG_PATH", "EVALUATION_LOG_PATH", "EPOCH_METRIC_PLOT_DIR",
     "VIDEO_OUTPUT_PATH",
 
