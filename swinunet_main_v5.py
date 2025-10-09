@@ -516,7 +516,7 @@ def custom_loss_function(output, targets, eps=1e-8):
     """
     # 物理量制約: 負の降水は0に、NaN/Infは安全値に置換
     output = torch.nan_to_num(output, nan=0.0, posinf=1e6, neginf=0.0)
-    output = torch.nn.functional.softplus(output).float()
+    output = torch.relu(output).float()
     target_1h = torch.nan_to_num(targets['target_1h'], nan=0.0, posinf=1e6, neginf=0.0).float()
     target_sum = torch.nan_to_num(targets['target_sum'], nan=0.0, posinf=1e6, neginf=0.0).float()
     # 物理的上限のクリッピング（極端値による勾配爆発を回避）
@@ -710,7 +710,7 @@ def validate_one_epoch(rank, model, dataloader, epoch, exec_log_path):
             total_sum_rmse += loss_sum.item()
 
             # 追加: 詳細メトリクス（Datasetでターゲットはmmに逆変換済み。出力もmmで扱う）
-            outputs = torch.nn.functional.softplus(outputs).float()
+            outputs = torch.relu(outputs).float()
             pred_1h_mm_t = outputs
             true_1h_mm_t = targets['target_1h'].float()
             true_sum_mm_t = targets['target_sum'].float()
@@ -998,7 +998,7 @@ def visualize_final_results(rank, world_size, valid_dataset, best_model_path, re
                     raise
             if isinstance(output, (tuple, list)):
                 output = output[0]
-            output = torch.nn.functional.softplus(output).squeeze(0)  # (3, H, W) on device
+            output = torch.relu(output).squeeze(0)  # (3, H, W) on device
 
             # min-max逆変換 + 積算一致補正（描画はmmスケールで統一）
             gm = load_group_minmax()
@@ -1369,7 +1369,7 @@ def evaluate_model(model_path, valid_dataset, device, eval_log_path, main_logger
 
         with autocast(device_type='cuda', dtype=AMP_TORCH_DTYPE):
             outputs = model(inputs)
-        outputs = torch.nn.functional.softplus(outputs).float()
+        outputs = torch.relu(outputs).float()
 
         # Datasetでターゲットはmmに逆変換済み。出力もmmとして扱う（評価では積算一致補正は適用しない）
         pred_1h_mm_t = outputs
@@ -1696,6 +1696,8 @@ def main_worker(rank, world_size, train_files, valid_files):
 
     if rank == 0:
         main_log.info("\nTraining finished.")
+        # v5: 拡張評価（最終モデル）を可視化より先に実行
+        evaluate_model(MODEL_SAVE_PATH, valid_dataset, dev, EVALUATION_LOG_PATH, main_log)
         
     try:
         visualize_final_results(rank, world_size, valid_dataset, MODEL_SAVE_PATH, RESULT_IMG_DIR, main_log, exec_log_path)
@@ -1711,8 +1713,6 @@ def main_worker(rank, world_size, train_files, valid_files):
         plot_loss_curve(loss_history, PLOT_SAVE_PATH, main_log, best_epoch)
         # 追加: エポックメトリクスの図
         plot_epoch_metrics(metric_history, EPOCH_METRIC_PLOT_DIR, main_log)
-        # v5: 拡張評価（最終モデル）
-        evaluate_model(MODEL_SAVE_PATH, valid_dataset, dev, EVALUATION_LOG_PATH, main_log)
         # v5: 画像→動画化
         create_video_from_images(RESULT_IMG_DIR, VIDEO_OUTPUT_PATH, VIDEO_FPS, main_log)
 

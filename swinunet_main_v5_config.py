@@ -91,7 +91,7 @@ CFG = {
         "pin_memory": True,
     },
     "TRAINING": {
-        "epochs": 3,
+        "epochs": 2,
         "amp_dtype": "bf16",      # "fp16" もしくは "bf16" - bf16は数値安定性が高い
         "use_grad_scaler": True,
         "ddp_find_unused_parameters": False,
