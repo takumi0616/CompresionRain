@@ -1679,12 +1679,12 @@ def main_worker(rank, world_size, train_files, valid_files):
     
     if world_size > 1:
         train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=max(NUM_WORKERS, 8), pin_memory=torch.cuda.is_available(), persistent_workers=True, prefetch_factor=4, sampler=train_sampler)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available(), sampler=train_sampler)
         valid_sampler = DistributedSampler(valid_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-        valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=max(NUM_WORKERS, 8), pin_memory=torch.cuda.is_available(), persistent_workers=True, prefetch_factor=4, sampler=valid_sampler)
+        valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available(), sampler=valid_sampler)
     else:
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=max(NUM_WORKERS, 8), pin_memory=torch.cuda.is_available(), persistent_workers=True, prefetch_factor=4)
-        valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=max(NUM_WORKERS, 8), pin_memory=torch.cuda.is_available(), persistent_workers=True, prefetch_factor=4)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
+        valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
     
     if world_size > 1:
         model = SwinTransformerSys(**MODEL_ARGS).to(rank)
