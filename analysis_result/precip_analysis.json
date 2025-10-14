@@ -1,0 +1,818 @@
+{
+  "dir": "/app/src/CompresionRain/optimization_nc",
+  "files_processed": 72,
+  "duration_sec": 1596.0952275767922,
+  "precip_group_minmax": {
+    "min": 0.0,
+    "max": 599.4375
+  },
+  "metrics": {
+    "sd_triplet_mm": {
+      "count": 4038451200,
+      "mean": 0.09327187000978461,
+      "stddev": 0.5031597350544841,
+      "max": 99.53691225319648
+    },
+    "max_minus_min_mm": {
+      "count": 4038451200,
+      "mean": 0.2148063611261676,
+      "stddev": 1.1564362001990514,
+      "max": 223.2499961161593
+    },
+    "max_minus_min_thresholds_mm": {
+      "thresholds_mm": [
+        0.0,
+        0.1,
+        0.5,
+        1.0,
+        2.0
+      ],
+      "counts": [
+        2960209634,
+        3412704406,
+        3703049998,
+        3826561478,
+        3927997488
+      ],
+      "ratios_percent": [
+        73.30061668195967,
+        84.50527781541597,
+        91.69480611775128,
+        94.75319345198476,
+        97.26494870112582
+      ],
+      "total_points": 4038451200,
+      "desc": "max(ft4,ft5,ft6) - min(ft4,ft5,ft6) が各閾値以下となる割合"
+    },
+    "errors_vs_sum3": {
+      "ft4_minus_sum3": {
+        "count": 4038451200,
+        "mae": 0.09513379489070967,
+        "rmse": 0.5587733464836555,
+        "mean_signed": 0.0007402986112493601,
+        "max_abs": 139.91666055470705
+      },
+      "ft5_minus_sum3": {
+        "count": 4038451200,
+        "mae": 0.06444908431216056,
+        "rmse": 0.40673602957913196,
+        "mean_signed": -0.00011014173619529285,
+        "max_abs": 129.4999915305525
+      },
+      "ft6_minus_sum3": {
+        "count": 4038451200,
+        "mae": 0.09503645926842338,
+        "rmse": 0.5549290329828842,
+        "mean_signed": -0.0006301564323357537,
+        "max_abs": 129.41666494309902
+      },
+      "desc": "Prec_Target_ftk - Prec_4_6h_sum/3 (mm)"
+    },
+    "sum_consistency_error": {
+      "count": 4038451200,
+      "mae": 1.2062867304955066e-08,
+      "rmse": 8.083841387862883e-08,
+      "mean_signed": 4.4271831486639103e-10,
+      "max_abs": 3.126310184597969e-05
+    }
+  },
+  "metrics_precip_only": {
+    "sd_triplet_mm": {
+      "count": 598928672,
+      "mean": 0.5060565489584754,
+      "stddev": 1.1293833320368483,
+      "max": 99.53691225319648
+    },
+    "max_minus_min_mm": {
+      "count": 598928672,
+      "mean": 1.1739390767447702,
+      "stddev": 2.6060543937904166,
+      "max": 223.2499961161593
+    },
+    "max_minus_min_thresholds_mm": {
+      "thresholds_mm": [
+        0.0,
+        0.1,
+        0.5,
+        1.0,
+        2.0
+      ],
+      "counts": [
+        18151466,
+        166156760,
+        334282575,
+        424199432,
+        504462125
+      ],
+      "ratios_percent": [
+        3.0306557105350933,
+        27.74232855561138,
+        55.81341996597552,
+        70.82636912062877,
+        84.22741280951732
+      ],
+      "total_points": 598928672,
+      "desc": "有降水のみ: max(ft4,ft5,ft6) - min(ft4,ft5,ft6) が各閾値以下となる割合"
+    },
+    "errors_vs_sum3": {
+      "ft4_minus_sum3": {
+        "count": 598928672,
+        "mae": 0.5094299446337537,
+        "rmse": 1.3297018555513656,
+        "mean_signed": -0.01923801579205701,
+        "max_abs": 139.91666055470705
+      },
+      "ft5_minus_sum3": {
+        "count": 598928672,
+        "mae": 0.3539215682552488,
+        "rmse": 1.0010518479907218,
+        "mean_signed": 0.03720227951210907,
+        "max_abs": 129.4999915305525
+      },
+      "ft6_minus_sum3": {
+        "count": 598928672,
+        "mae": 0.5125576379915355,
+        "rmse": 1.3507731109467926,
+        "mean_signed": -0.017964260926952927,
+        "max_abs": 129.41666494309902
+      },
+      "desc": "有降水のみ: Prec_Target_ftk - Prec_4_6h_sum/3 (mm)"
+    },
+    "sum_consistency_error": {
+      "count": 598928672,
+      "mae": 7.484738473512765e-08,
+      "rmse": 2.0601030775971042e-07,
+      "mean_signed": 2.7930989344209112e-09,
+      "max_abs": 3.126310184597969e-05
+    }
+  },
+  "pairwise_correlation": {
+    "corr(ft4,ft5)": 0.6859437742336151,
+    "corr(ft4,ft6)": 0.47689499328250706,
+    "corr(ft5,ft6)": 0.6897855724970946
+  },
+  "pairwise_correlation_precip_only": {
+    "corr(ft4,ft5)": 0.6698980379023511,
+    "corr(ft4,ft6)": 0.44386696265154135,
+    "corr(ft5,ft6)": 0.6617615103420935
+  },
+  "per_file": [
+    {
+      "file": "201801.nc",
+      "present": true,
+      "dur": 4688600.628640713,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "201802.nc",
+      "present": true,
+      "dur": 4688645.570173734,
+      "counts": {
+        "triplet_points": 51609600,
+        "sum_points": 51609600
+      }
+    },
+    {
+      "file": "201803.nc",
+      "present": true,
+      "dur": 4688643.999344695,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "201804.nc",
+      "present": true,
+      "dur": 4688673.894149386,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "201805.nc",
+      "present": true,
+      "dur": 4688688.307029618,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "201806.nc",
+      "present": true,
+      "dur": 4688717.961936421,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "201807.nc",
+      "present": true,
+      "dur": 4688732.299581207,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "201808.nc",
+      "present": true,
+      "dur": 4688754.744657268,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "201809.nc",
+      "present": true,
+      "dur": 4688784.262326996,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "201810.nc",
+      "present": true,
+      "dur": 4688798.574519368,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "201811.nc",
+      "present": true,
+      "dur": 4688828.177088942,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "201812.nc",
+      "present": true,
+      "dur": 4688842.789148399,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "201901.nc",
+      "present": true,
+      "dur": 4688865.510539747,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "201902.nc",
+      "present": true,
+      "dur": 4688909.983246242,
+      "counts": {
+        "triplet_points": 51609600,
+        "sum_points": 51609600
+      }
+    },
+    {
+      "file": "201903.nc",
+      "present": true,
+      "dur": 4688908.402044607,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "201904.nc",
+      "present": true,
+      "dur": 4688937.955227988,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "201905.nc",
+      "present": true,
+      "dur": 4688952.169706184,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "201906.nc",
+      "present": true,
+      "dur": 4688981.97413191,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "201907.nc",
+      "present": true,
+      "dur": 4688996.401967532,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "201908.nc",
+      "present": true,
+      "dur": 4689018.693157,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "201909.nc",
+      "present": true,
+      "dur": 4689048.372420793,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "201910.nc",
+      "present": true,
+      "dur": 4689062.671204205,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "201911.nc",
+      "present": true,
+      "dur": 4689092.219297157,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "201912.nc",
+      "present": true,
+      "dur": 4689107.02729209,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202001.nc",
+      "present": true,
+      "dur": 4689129.782223406,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202002.nc",
+      "present": true,
+      "dur": 4689167.077527713,
+      "counts": {
+        "triplet_points": 53452800,
+        "sum_points": 53452800
+      }
+    },
+    {
+      "file": "202003.nc",
+      "present": true,
+      "dur": 4689173.315611313,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202004.nc",
+      "present": true,
+      "dur": 4689203.214189892,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "202005.nc",
+      "present": true,
+      "dur": 4689217.974997919,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202006.nc",
+      "present": true,
+      "dur": 4689248.16196932,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "202007.nc",
+      "present": true,
+      "dur": 4689263.215522872,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202008.nc",
+      "present": true,
+      "dur": 4689286.253105488,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202009.nc",
+      "present": true,
+      "dur": 4689316.629420904,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "202010.nc",
+      "present": true,
+      "dur": 4689331.445039575,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202011.nc",
+      "present": true,
+      "dur": 4689361.52359936,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "202012.nc",
+      "present": true,
+      "dur": 4689376.92985949,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202101.nc",
+      "present": true,
+      "dur": 4689400.328207755,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202102.nc",
+      "present": true,
+      "dur": 4689445.027580178,
+      "counts": {
+        "triplet_points": 51609600,
+        "sum_points": 51609600
+      }
+    },
+    {
+      "file": "202103.nc",
+      "present": true,
+      "dur": 4689443.542712495,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202104.nc",
+      "present": true,
+      "dur": 4689473.434454653,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "202105.nc",
+      "present": true,
+      "dur": 4689488.224686388,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202106.nc",
+      "present": true,
+      "dur": 4689518.482924793,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "202107.nc",
+      "present": true,
+      "dur": 4689533.36213822,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202108.nc",
+      "present": true,
+      "dur": 4689556.280571803,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202109.nc",
+      "present": true,
+      "dur": 4689586.190414693,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "202110.nc",
+      "present": true,
+      "dur": 4689600.730142513,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202111.nc",
+      "present": true,
+      "dur": 4689630.674360067,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "202112.nc",
+      "present": true,
+      "dur": 4689645.767577119,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202201.nc",
+      "present": true,
+      "dur": 4689668.824437301,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202202.nc",
+      "present": true,
+      "dur": 4689713.566096116,
+      "counts": {
+        "triplet_points": 51609600,
+        "sum_points": 51609600
+      }
+    },
+    {
+      "file": "202203.nc",
+      "present": true,
+      "dur": 4689711.703578741,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202204.nc",
+      "present": true,
+      "dur": 4689741.0378036,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "202205.nc",
+      "present": true,
+      "dur": 4689755.404149596,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202206.nc",
+      "present": true,
+      "dur": 4689785.317630004,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "202207.nc",
+      "present": true,
+      "dur": 4689800.144014653,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202208.nc",
+      "present": true,
+      "dur": 4689822.676606293,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202209.nc",
+      "present": true,
+      "dur": 4689852.658632168,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "202210.nc",
+      "present": true,
+      "dur": 4689866.876724629,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202211.nc",
+      "present": true,
+      "dur": 4689896.54986862,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "202212.nc",
+      "present": true,
+      "dur": 4689911.72051435,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202301.nc",
+      "present": true,
+      "dur": 4689934.92374889,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202302.nc",
+      "present": true,
+      "dur": 4689979.403300576,
+      "counts": {
+        "triplet_points": 51609600,
+        "sum_points": 51609600
+      }
+    },
+    {
+      "file": "202303.nc",
+      "present": true,
+      "dur": 4689977.518981885,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202304.nc",
+      "present": true,
+      "dur": 4690007.171082699,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "202305.nc",
+      "present": true,
+      "dur": 4690021.469284215,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202306.nc",
+      "present": true,
+      "dur": 4690051.378333691,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "202307.nc",
+      "present": true,
+      "dur": 4690066.039414689,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202308.nc",
+      "present": true,
+      "dur": 4690089.356206105,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202309.nc",
+      "present": true,
+      "dur": 4690119.189676793,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "202310.nc",
+      "present": true,
+      "dur": 4690133.422927764,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    },
+    {
+      "file": "202311.nc",
+      "present": true,
+      "dur": 4690163.258941549,
+      "counts": {
+        "triplet_points": 55296000,
+        "sum_points": 55296000
+      }
+    },
+    {
+      "file": "202312.nc",
+      "present": true,
+      "dur": 4690178.251824228,
+      "counts": {
+        "triplet_points": 57139200,
+        "sum_points": 57139200
+      }
+    }
+  ],
+  "notes": [
+    "値はすべて mm に逆変換した後に算出。",
+    "metrics: 全データ（降水0を含む）の統計。",
+    "metrics_precip_only: 3つのターゲットと積算がすべて>0のデータのみの統計。",
+    "sd_triplet は各時刻・各画素で3つのターゲットの標準偏差を取り、その平均/分散/最大を全域で集計。",
+    "max_minus_min は各時刻・各画素で max-min を取り、その平均/分散/最大を集計。閾値別割合も併記。",
+    "errors_vs_sum3 は Prec_Target_ftk - Prec_4_6h_sum/3 の MAE/RMSE/平均符号/最大絶対値。",
+    "sum_consistency_error は (ft4+ft5+ft6) - Prec_4_6h_sum の誤差。precip グループは同一スケールで正規化しているため、理論上は線形関係が保存されるが、入出力やNaN処理に起因する微小差があればここに現れる。"
+  ]
+}

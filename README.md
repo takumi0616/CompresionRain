@@ -29,7 +29,7 @@ notify-run gpu01 -- nohup python separate_main_v2.py > separate_main_v2.log 2>&1
 
 nohup python data_check_separate.py > data_check_separate.log 2>&1 &
 
-nohup python check_output_nc.py > check_output_nc.log 2>&1 &
+nohup python check_prmsl.py > check_prmsl.log 2>&1 &
 
 ```
 
@@ -76,5 +76,5 @@ sudo kill -9 1493785
 ## gpu01 → mac
 
 ```bash
-rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/CompresionRain/swin-unet_ratio_result_v2 /Users/takumi0616/Develop/docker_miniconda/src/CompresionRain/result_gpu01
+rsync -avz --progress gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/CompresionRain/swin-unet_main_result_v5 /Users/takumi0616/Develop/docker_miniconda/src/CompresionRain/result_gpu02
 ```
