@@ -1,7 +1,7 @@
 {
   "dir": "/app/src/CompresionRain/optimization_nc",
   "files_processed": 72,
-  "duration_sec": 1596.0952275767922,
+  "duration_sec": 1651.0383235961199,
   "precip_group_minmax": {
     "min": 0.0,
     "max": 599.4375
@@ -160,7 +160,7 @@
     {
       "file": "201801.nc",
       "present": true,
-      "dur": 4688600.628640713,
+      "dur": 4757848.050963221,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -169,7 +169,7 @@
     {
       "file": "201802.nc",
       "present": true,
-      "dur": 4688645.570173734,
+      "dur": 4757893.599495414,
       "counts": {
         "triplet_points": 51609600,
         "sum_points": 51609600
@@ -178,7 +178,7 @@
     {
       "file": "201803.nc",
       "present": true,
-      "dur": 4688643.999344695,
+      "dur": 4757892.740739467,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -187,7 +187,7 @@
     {
       "file": "201804.nc",
       "present": true,
-      "dur": 4688673.894149386,
+      "dur": 4757923.189665812,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -196,7 +196,7 @@
     {
       "file": "201805.nc",
       "present": true,
-      "dur": 4688688.307029618,
+      "dur": 4757938.710324638,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -205,7 +205,7 @@
     {
       "file": "201806.nc",
       "present": true,
-      "dur": 4688717.961936421,
+      "dur": 4757969.493237724,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -214,7 +214,7 @@
     {
       "file": "201807.nc",
       "present": true,
-      "dur": 4688732.299581207,
+      "dur": 4757984.604598483,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -223,7 +223,7 @@
     {
       "file": "201808.nc",
       "present": true,
-      "dur": 4688754.744657268,
+      "dur": 4758007.662051084,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -232,7 +232,7 @@
     {
       "file": "201809.nc",
       "present": true,
-      "dur": 4688784.262326996,
+      "dur": 4758037.8445802,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -241,7 +241,7 @@
     {
       "file": "201810.nc",
       "present": true,
-      "dur": 4688798.574519368,
+      "dur": 4758052.67965741,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -250,7 +250,7 @@
     {
       "file": "201811.nc",
       "present": true,
-      "dur": 4688828.177088942,
+      "dur": 4758082.749525147,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -259,7 +259,7 @@
     {
       "file": "201812.nc",
       "present": true,
-      "dur": 4688842.789148399,
+      "dur": 4758098.295052031,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -268,7 +268,7 @@
     {
       "file": "201901.nc",
       "present": true,
-      "dur": 4688865.510539747,
+      "dur": 4758121.637598917,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -277,7 +277,7 @@
     {
       "file": "201902.nc",
       "present": true,
-      "dur": 4688909.983246242,
+      "dur": 4758166.580603941,
       "counts": {
         "triplet_points": 51609600,
         "sum_points": 51609600
@@ -286,7 +286,7 @@
     {
       "file": "201903.nc",
       "present": true,
-      "dur": 4688908.402044607,
+      "dur": 4758165.577490535,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -295,7 +295,7 @@
     {
       "file": "201904.nc",
       "present": true,
-      "dur": 4688937.955227988,
+      "dur": 4758195.795967793,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -304,7 +304,7 @@
     {
       "file": "201905.nc",
       "present": true,
-      "dur": 4688952.169706184,
+      "dur": 4758210.769707853,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -313,7 +313,7 @@
     {
       "file": "201906.nc",
       "present": true,
-      "dur": 4688981.97413191,
+      "dur": 4758241.335115975,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -322,7 +322,7 @@
     {
       "file": "201907.nc",
       "present": true,
-      "dur": 4688996.401967532,
+      "dur": 4758256.508672145,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -331,7 +331,7 @@
     {
       "file": "201908.nc",
       "present": true,
-      "dur": 4689018.693157,
+      "dur": 4758279.565490799,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -340,7 +340,7 @@
     {
       "file": "201909.nc",
       "present": true,
-      "dur": 4689048.372420793,
+      "dur": 4758309.752955017,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -349,7 +349,7 @@
     {
       "file": "201910.nc",
       "present": true,
-      "dur": 4689062.671204205,
+      "dur": 4758324.585678409,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -358,7 +358,7 @@
     {
       "file": "201911.nc",
       "present": true,
-      "dur": 4689092.219297157,
+      "dur": 4758354.766809732,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -367,7 +367,7 @@
     {
       "file": "201912.nc",
       "present": true,
-      "dur": 4689107.02729209,
+      "dur": 4758370.088541637,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -376,7 +376,7 @@
     {
       "file": "202001.nc",
       "present": true,
-      "dur": 4689129.782223406,
+      "dur": 4758393.422458326,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -385,7 +385,7 @@
     {
       "file": "202002.nc",
       "present": true,
-      "dur": 4689167.077527713,
+      "dur": 4758431.257047585,
       "counts": {
         "triplet_points": 53452800,
         "sum_points": 53452800
@@ -394,7 +394,7 @@
     {
       "file": "202003.nc",
       "present": true,
-      "dur": 4689173.315611313,
+      "dur": 4758438.365679423,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -403,7 +403,7 @@
     {
       "file": "202004.nc",
       "present": true,
-      "dur": 4689203.214189892,
+      "dur": 4758468.925275541,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -412,7 +412,7 @@
     {
       "file": "202005.nc",
       "present": true,
-      "dur": 4689217.974997919,
+      "dur": 4758484.389888973,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -421,7 +421,7 @@
     {
       "file": "202006.nc",
       "present": true,
-      "dur": 4689248.16196932,
+      "dur": 4758515.215796292,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -430,7 +430,7 @@
     {
       "file": "202007.nc",
       "present": true,
-      "dur": 4689263.215522872,
+      "dur": 4758530.974547519,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -439,7 +439,7 @@
     {
       "file": "202008.nc",
       "present": true,
-      "dur": 4689286.253105488,
+      "dur": 4758554.720072577,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -448,7 +448,7 @@
     {
       "file": "202009.nc",
       "present": true,
-      "dur": 4689316.629420904,
+      "dur": 4758585.891062416,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -457,7 +457,7 @@
     {
       "file": "202010.nc",
       "present": true,
-      "dur": 4689331.445039575,
+      "dur": 4758601.299379289,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -466,7 +466,7 @@
     {
       "file": "202011.nc",
       "present": true,
-      "dur": 4689361.52359936,
+      "dur": 4758631.998433519,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -475,7 +475,7 @@
     {
       "file": "202012.nc",
       "present": true,
-      "dur": 4689376.92985949,
+      "dur": 4758648.196277181,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -484,7 +484,7 @@
     {
       "file": "202101.nc",
       "present": true,
-      "dur": 4689400.328207755,
+      "dur": 4758672.334304333,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -493,7 +493,7 @@
     {
       "file": "202102.nc",
       "present": true,
-      "dur": 4689445.027580178,
+      "dur": 4758717.678902764,
       "counts": {
         "triplet_points": 51609600,
         "sum_points": 51609600
@@ -502,7 +502,7 @@
     {
       "file": "202103.nc",
       "present": true,
-      "dur": 4689443.542712495,
+      "dur": 4758716.844577015,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -511,7 +511,7 @@
     {
       "file": "202104.nc",
       "present": true,
-      "dur": 4689473.434454653,
+      "dur": 4758747.308098,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -520,7 +520,7 @@
     {
       "file": "202105.nc",
       "present": true,
-      "dur": 4689488.224686388,
+      "dur": 4758762.741898706,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -529,7 +529,7 @@
     {
       "file": "202106.nc",
       "present": true,
-      "dur": 4689518.482924793,
+      "dur": 4758793.700014024,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -538,7 +538,7 @@
     {
       "file": "202107.nc",
       "present": true,
-      "dur": 4689533.36213822,
+      "dur": 4758809.430570347,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -547,7 +547,7 @@
     {
       "file": "202108.nc",
       "present": true,
-      "dur": 4689556.280571803,
+      "dur": 4758833.291050576,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -556,7 +556,7 @@
     {
       "file": "202109.nc",
       "present": true,
-      "dur": 4689586.190414693,
+      "dur": 4758864.227601305,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -565,7 +565,7 @@
     {
       "file": "202110.nc",
       "present": true,
-      "dur": 4689600.730142513,
+      "dur": 4758879.67198692,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -574,7 +574,7 @@
     {
       "file": "202111.nc",
       "present": true,
-      "dur": 4689630.674360067,
+      "dur": 4758910.491091789,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -583,7 +583,7 @@
     {
       "file": "202112.nc",
       "present": true,
-      "dur": 4689645.767577119,
+      "dur": 4758926.273842718,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -592,7 +592,7 @@
     {
       "file": "202201.nc",
       "present": true,
-      "dur": 4689668.824437301,
+      "dur": 4758950.28884413,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -601,7 +601,7 @@
     {
       "file": "202202.nc",
       "present": true,
-      "dur": 4689713.566096116,
+      "dur": 4758995.928036702,
       "counts": {
         "triplet_points": 51609600,
         "sum_points": 51609600
@@ -610,7 +610,7 @@
     {
       "file": "202203.nc",
       "present": true,
-      "dur": 4689711.703578741,
+      "dur": 4758995.122812851,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -619,7 +619,7 @@
     {
       "file": "202204.nc",
       "present": true,
-      "dur": 4689741.0378036,
+      "dur": 4759025.416979321,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -628,7 +628,7 @@
     {
       "file": "202205.nc",
       "present": true,
-      "dur": 4689755.404149596,
+      "dur": 4759040.937200054,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -637,7 +637,7 @@
     {
       "file": "202206.nc",
       "present": true,
-      "dur": 4689785.317630004,
+      "dur": 4759071.695169195,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -646,7 +646,7 @@
     {
       "file": "202207.nc",
       "present": true,
-      "dur": 4689800.144014653,
+      "dur": 4759087.493608455,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -655,7 +655,7 @@
     {
       "file": "202208.nc",
       "present": true,
-      "dur": 4689822.676606293,
+      "dur": 4759110.922919256,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -664,7 +664,7 @@
     {
       "file": "202209.nc",
       "present": true,
-      "dur": 4689852.658632168,
+      "dur": 4759141.79249976,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -673,7 +673,7 @@
     {
       "file": "202210.nc",
       "present": true,
-      "dur": 4689866.876724629,
+      "dur": 4759157.146763929,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -682,7 +682,7 @@
     {
       "file": "202211.nc",
       "present": true,
-      "dur": 4689896.54986862,
+      "dur": 4759187.641093654,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -691,7 +691,7 @@
     {
       "file": "202212.nc",
       "present": true,
-      "dur": 4689911.72051435,
+      "dur": 4759203.787158477,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -700,7 +700,7 @@
     {
       "file": "202301.nc",
       "present": true,
-      "dur": 4689934.92374889,
+      "dur": 4759227.664427187,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -709,7 +709,7 @@
     {
       "file": "202302.nc",
       "present": true,
-      "dur": 4689979.403300576,
+      "dur": 4759272.885898822,
       "counts": {
         "triplet_points": 51609600,
         "sum_points": 51609600
@@ -718,7 +718,7 @@
     {
       "file": "202303.nc",
       "present": true,
-      "dur": 4689977.518981885,
+      "dur": 4759271.838571204,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -727,7 +727,7 @@
     {
       "file": "202304.nc",
       "present": true,
-      "dur": 4690007.171082699,
+      "dur": 4759302.317059575,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -736,7 +736,7 @@
     {
       "file": "202305.nc",
       "present": true,
-      "dur": 4690021.469284215,
+      "dur": 4759317.421735726,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -745,7 +745,7 @@
     {
       "file": "202306.nc",
       "present": true,
-      "dur": 4690051.378333691,
+      "dur": 4759348.110037979,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -754,7 +754,7 @@
     {
       "file": "202307.nc",
       "present": true,
-      "dur": 4690066.039414689,
+      "dur": 4759363.62117725,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -763,7 +763,7 @@
     {
       "file": "202308.nc",
       "present": true,
-      "dur": 4690089.356206105,
+      "dur": 4759387.761952349,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -772,7 +772,7 @@
     {
       "file": "202309.nc",
       "present": true,
-      "dur": 4690119.189676793,
+      "dur": 4759418.498170675,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -781,7 +781,7 @@
     {
       "file": "202310.nc",
       "present": true,
-      "dur": 4690133.422927764,
+      "dur": 4759433.634058709,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -790,7 +790,7 @@
     {
       "file": "202311.nc",
       "present": true,
-      "dur": 4690163.258941549,
+      "dur": 4759464.283465514,
       "counts": {
         "triplet_points": 55296000,
         "sum_points": 55296000
@@ -799,7 +799,7 @@
     {
       "file": "202312.nc",
       "present": true,
-      "dur": 4690178.251824228,
+      "dur": 4759480.127153169,
       "counts": {
         "triplet_points": 57139200,
         "sum_points": 57139200
@@ -814,5 +814,180 @@
     "max_minus_min は各時刻・各画素で max-min を取り、その平均/分散/最大を集計。閾値別割合も併記。",
     "errors_vs_sum3 は Prec_Target_ftk - Prec_4_6h_sum/3 の MAE/RMSE/平均符号/最大絶対値。",
     "sum_consistency_error は (ft4+ft5+ft6) - Prec_4_6h_sum の誤差。precip グループは同一スケールで正規化しているため、理論上は線形関係が保存されるが、入出力やNaN処理に起因する微小差があればここに現れる。"
-  ]
+  ],
+  "intensity_distribution": {
+    "bins_1h_mm": [
+      1.0,
+      5.0,
+      10.0,
+      20.0,
+      30.0,
+      50.0
+    ],
+    "counts_1h": [
+      11617353737,
+      419108337,
+      57722776,
+      17371480,
+      2505170,
+      1011650,
+      280450
+    ],
+    "ratios_1h_percent": [
+      95.88951441747436,
+      3.4593157644197854,
+      0.4764431803294623,
+      0.1433840115075139,
+      0.02067764658556891,
+      0.008350148360506788,
+      0.0023148313227935834
+    ],
+    "total_1h": 12115353600,
+    "bins_sum_mm": [
+      2.0,
+      10.0,
+      20.0,
+      40.0,
+      60.0,
+      100.0
+    ],
+    "counts_sum": [
+      3802669186,
+      190532508,
+      32200570,
+      10603498,
+      1706796,
+      605853,
+      132789
+    ],
+    "ratios_sum_percent": [
+      94.1615732783895,
+      4.717959895120188,
+      0.7973494888337391,
+      0.26256347978155586,
+      0.04226362819488818,
+      0.015002112691122775,
+      0.003288116989008063
+    ],
+    "total_sum": 4038451200,
+    "precip_only": {
+      "bins_1h_mm": [
+        1.0,
+        5.0,
+        10.0,
+        20.0,
+        30.0,
+        50.0
+      ],
+      "counts_1h": [
+        1341022931,
+        380773396,
+        54815656,
+        16596565,
+        2366561,
+        947507,
+        263400
+      ],
+      "ratios_1h_percent": [
+        74.63453739390634,
+        21.191916711800587,
+        3.0507614992479994,
+        0.9236806638192359,
+        0.13171078686756654,
+        0.05273343578827141,
+        0.01465950856999546
+      ],
+      "total_1h": 1796786016,
+      "bins_sum_mm": [
+        2.0,
+        10.0,
+        20.0,
+        40.0,
+        60.0,
+        100.0
+      ],
+      "counts_sum": [
+        383410915,
+        171613824,
+        31158304,
+        10353945,
+        1667746,
+        592766,
+        131172
+      ],
+      "ratios_sum_percent": [
+        64.01612294159797,
+        28.653466100884884,
+        5.202339686953574,
+        1.7287442535394264,
+        0.2784548608152124,
+        0.09897105076311992,
+        0.021901105445825107
+      ],
+      "total_sum": 598928672
+    }
+  },
+  "suggested_weights": {
+    "alpha": 1.0,
+    "min": 1.0,
+    "max": 10.0,
+    "weights_1h": {
+      "bins_mm": [
+        1.0,
+        5.0,
+        10.0,
+        20.0,
+        30.0,
+        50.0
+      ],
+      "values": [
+        1.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0
+      ],
+      "counts": [
+        11617353737,
+        419108337,
+        57722776,
+        17371480,
+        2505170,
+        1011650,
+        280450
+      ],
+      "total": 12115353600
+    },
+    "weights_sum": {
+      "bins_mm": [
+        2.0,
+        10.0,
+        20.0,
+        40.0,
+        60.0,
+        100.0
+      ],
+      "values": [
+        1.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0
+      ],
+      "counts": [
+        3802669186,
+        190532508,
+        32200570,
+        10603498,
+        1706796,
+        605853,
+        132789
+      ],
+      "total": 4038451200
+    }
+  }
 }

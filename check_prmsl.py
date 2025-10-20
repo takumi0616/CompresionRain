@@ -453,6 +453,31 @@ def process_file(fp: Path, gmin: float, gmax: float, time_chunk: int,
                 # 形状を揃えて 1次元へ
                 a4v = a4.ravel(); a5v = a5.ravel(); a6v = a6.ravel(); asumv = asum.ravel()
 
+                # ビン分布（全データ）
+                try:
+                    # 1h（3chを独立サンプルとして集計）
+                    vals_1h = []
+                    for vv in (a4v, a5v, a6v):
+                        mvv = np.isfinite(vv)
+                        if np.any(mvv):
+                            vals_1h.append(vv[mvv])
+                    if len(vals_1h) > 0:
+                        vcat = np.concatenate(vals_1h, axis=0)
+                        idx = np.digitize(vcat, aggregators["bins_1h"], right=False)
+                        c = np.bincount(idx, minlength=aggregators["bins_1h"].size + 1)
+                        aggregators["count_1h"] += c.astype(np.int64)
+                        aggregators["count_1h_total"] += int(vcat.size)
+                    # 3h積算
+                    ms_all = np.isfinite(asumv)
+                    if np.any(ms_all):
+                        vs = asumv[ms_all]
+                        idxs = np.digitize(vs, aggregators["bins_sum"], right=False)
+                        cs = np.bincount(idxs, minlength=aggregators["bins_sum"].size + 1)
+                        aggregators["count_sum"] += cs.astype(np.int64)
+                        aggregators["count_sum_total"] += int(vs.size)
+                except Exception:
+                    pass
+
                 # 有効マスク
                 m3 = np.isfinite(a4v) & np.isfinite(a5v) & np.isfinite(a6v)
                 ms = np.isfinite(asumv)
@@ -508,6 +533,22 @@ def process_file(fp: Path, gmin: float, gmax: float, time_chunk: int,
                             aggregators_precip_only["maxmin_triplet"].update(rngp)
                             aggregators_precip_only["sample_sd"].add(sd3p)
                             aggregators_precip_only["sample_rng"].add(rngp)
+
+                            # ビン分布（有降水のみ）
+                            try:
+                                vcatp = np.concatenate([x4p, x5p, x6p], axis=0)
+                                idxp = np.digitize(vcatp, aggregators_precip_only["bins_1h"], right=False)
+                                cp = np.bincount(idxp, minlength=aggregators_precip_only["bins_1h"].size + 1)
+                                aggregators_precip_only["count_1h"] += cp.astype(np.int64)
+                                aggregators_precip_only["count_1h_total"] += int(vcatp.size)
+
+                                sp = s_m3s[precip_mask_m3s]
+                                idxsp = np.digitize(sp, aggregators_precip_only["bins_sum"], right=False)
+                                csp = np.bincount(idxsp, minlength=aggregators_precip_only["bins_sum"].size + 1)
+                                aggregators_precip_only["count_sum"] += csp.astype(np.int64)
+                                aggregators_precip_only["count_sum_total"] += int(sp.size)
+                            except Exception:
+                                pass
 
                             ths_p = aggregators_precip_only["maxmin_thresholds"]["thresholds"]
                             for i, thr in enumerate(ths_p):
@@ -619,6 +660,13 @@ def main():
     parser.add_argument("--no-figs", action="store_true", help="図の保存を無効化")
     parser.add_argument("--sample-points", type=int, default=200000, help="図作成用のサンプル上限（全体からランダム抽出）")
     parser.add_argument("--hexbin-gridsize", type=int, default=60, help="Hexbin のグリッドサイズ")
+    # 追加: 降水強度の分布集計と重み提案用オプション
+    parser.add_argument("--bins-1h", type=str, default="", help="1時間降水(mm/h)のビン境界（カンマ区切り: 例 '1,5,10,20,30,50'）")
+    parser.add_argument("--bins-sum", type=str, default="", help="3時間積算(mm/3h)のビン境界（カンマ区切り: 例 '2,10,20,40,60,100'）")
+    parser.add_argument("--suggest-alpha", type=float, default=1.0, help="重み提案の指数α (w_i ∝ 1/p_i^α)")
+    parser.add_argument("--suggest-min", type=float, default=1.0, help="重みの下限（クリップ）")
+    parser.add_argument("--suggest-max", type=float, default=10.0, help="重みの上限（クリップ）")
+    parser.add_argument("--export-suggested-weights", type=str, default="", help="提案重みを保存するJSONパス（省略時: analysis_result/suggested_intensity_weights.json）")
     args = parser.parse_args()
 
     setup_logger(args.verbose)
@@ -657,6 +705,41 @@ def main():
     # スケーラ読み込み（precip）
     gmin, gmax = load_precip_minmax(scaler_path)
     logging.info(f"[INFO] precip group min/max: min={gmin}, max={gmax}")
+
+    # 追加: 分布集計に用いるビン境界（未指定なら設定ファイルのLOSSビン、なければ既定値）
+    def _parse_bins_arg(s: str, default_list):
+        if s:
+            try:
+                vals = [float(x.strip()) for x in s.split(",") if x.strip() != ""]
+                vals = sorted(vals)
+                return vals
+            except Exception:
+                logging.warning("[WARN] --bins の解釈に失敗したため既定値を使用します。")
+                return list(default_list)
+        return list(default_list)
+
+    bins_1h_default = [1.0, 5.0, 10.0, 20.0, 30.0, 50.0]
+    bins_sum_default = [2.0, 10.0, 20.0, 40.0, 60.0, 100.0]
+    try:
+        # 設定ファイルのLOSSビンを優先
+        from swinunet_main_v5_config import INTENSITY_WEIGHT_BINS_1H as _CFG_B1, INTENSITY_WEIGHT_BINS_SUM as _CFG_BS
+        if isinstance(_CFG_B1, list) and len(_CFG_B1) > 0:
+            bins_1h_default = list(_CFG_B1)
+        if isinstance(_CFG_BS, list) and len(_CFG_BS) > 0:
+            bins_sum_default = list(_CFG_BS)
+    except Exception:
+        pass
+
+    bins_1h = np.array(_parse_bins_arg(args.bins_1h, bins_1h_default), dtype=np.float64)
+    bins_sum = np.array(_parse_bins_arg(args.bins_sum, bins_sum_default), dtype=np.float64)
+    suggest_alpha = float(args.suggest_alpha)
+    suggest_min = float(args.suggest_min)
+    suggest_max = float(args.suggest_max)
+    suggest_out_path = Path(args.export_suggested_weights).resolve() if args.export_suggested_weights else (output_dir / "suggested_intensity_weights.json").resolve()
+
+    logging.info(f"[INFO] 1h bins(mm/h): {bins_1h.tolist()}")
+    logging.info(f"[INFO] sum bins(mm/3h): {bins_sum.tolist()}")
+    logging.info(f"[INFO] weight suggestion params: alpha={suggest_alpha}, min={suggest_min}, max={suggest_max}")
 
     # ファイル列挙（yyyymm.nc 優先、見つからなければ全 *.nc）
     nc_files = sorted([p for p in base_dir.glob("*.nc") if re.match(YM_PAT, p.name)], key=lambda p: re.match(YM_PAT, p.name).group(1) if re.match(YM_PAT, p.name) else p.name)
@@ -699,6 +782,13 @@ def main():
         "pair_ft4_ft5": PairReservoirSampler(min(args.sample_points, 300000)),
         "pair_ft4_ft6": PairReservoirSampler(min(args.sample_points, 300000)),
         "pair_ft5_ft6": PairReservoirSampler(min(args.sample_points, 300000)),
+        # Intensity distributions (1h: 3chを独立サンプルとして集計, sum: 3h積算)
+        "bins_1h": bins_1h,
+        "count_1h": np.zeros(bins_1h.size + 1, dtype=np.int64),
+        "count_1h_total": 0,
+        "bins_sum": bins_sum,
+        "count_sum": np.zeros(bins_sum.size + 1, dtype=np.int64),
+        "count_sum_total": 0,
     }
 
     # 集計器の準備（有降水のみ用: 3つのターゲットと積算がすべて0でないケース）
@@ -726,6 +816,13 @@ def main():
         "pair_ft4_ft5": PairReservoirSampler(min(args.sample_points, 300000)),
         "pair_ft4_ft6": PairReservoirSampler(min(args.sample_points, 300000)),
         "pair_ft5_ft6": PairReservoirSampler(min(args.sample_points, 300000)),
+        # Intensity distributions (precip-only)
+        "bins_1h": bins_1h,
+        "count_1h": np.zeros(bins_1h.size + 1, dtype=np.int64),
+        "count_1h_total": 0,
+        "bins_sum": bins_sum,
+        "count_sum": np.zeros(bins_sum.size + 1, dtype=np.int64),
+        "count_sum_total": 0,
     }
 
     # 実行
@@ -821,6 +918,72 @@ def main():
         ],
     }
 
+    # 追加: ビン分布と重み提案の導出
+    def _compute_ratios(counts_arr: np.ndarray, total_n: int) -> List[float]:
+        if total_n <= 0:
+            return [0.0] * int(counts_arr.size)
+        return [(float(c) / float(total_n) * 100.0) for c in counts_arr.astype(np.int64).tolist()]
+
+    counts_1h_all = aggregators["count_1h"]; total_1h_all = int(aggregators["count_1h_total"]); ratios_1h_all = _compute_ratios(counts_1h_all, total_1h_all)
+    counts_sum_all = aggregators["count_sum"]; total_sum_all = int(aggregators["count_sum_total"]); ratios_sum_all = _compute_ratios(counts_sum_all, total_sum_all)
+
+    counts_1h_p = aggregators_precip_only["count_1h"]; total_1h_p = int(aggregators_precip_only["count_1h_total"]); ratios_1h_p = _compute_ratios(counts_1h_p, total_1h_p)
+    counts_sum_p = aggregators_precip_only["count_sum"]; total_sum_p = int(aggregators_precip_only["count_sum_total"]); ratios_sum_p = _compute_ratios(counts_sum_p, total_sum_p)
+
+    def _suggest_weights(counts_arr: np.ndarray, wmin: float, wmax: float, alpha: float) -> List[float]:
+        total = int(np.sum(counts_arr))
+        nbin = int(counts_arr.size)
+        if total <= 0 or nbin == 0:
+            return [1.0] * nbin
+        p = counts_arr.astype(np.float64) / float(total)
+        p_ref = float(np.max(p)) if float(np.max(p)) > 0 else 1.0
+        eps = 1e-12
+        w = (p_ref / np.maximum(p, eps)) ** float(alpha)
+        w = np.clip(w, float(wmin), float(wmax))
+        return [float(x) for x in w.tolist()]
+
+    suggested_weights_1h = _suggest_weights(counts_1h_all, suggest_min, suggest_max, suggest_alpha)
+    suggested_weights_sum = _suggest_weights(counts_sum_all, suggest_min, suggest_max, suggest_alpha)
+
+    # out へ格納（後段の図/レポート作成で使用）
+    out["intensity_distribution"] = {
+        "bins_1h_mm": aggregators["bins_1h"].astype(float).tolist(),
+        "counts_1h": counts_1h_all.astype(int).tolist(),
+        "ratios_1h_percent": ratios_1h_all,
+        "total_1h": total_1h_all,
+        "bins_sum_mm": aggregators["bins_sum"].astype(float).tolist(),
+        "counts_sum": counts_sum_all.astype(int).tolist(),
+        "ratios_sum_percent": ratios_sum_all,
+        "total_sum": total_sum_all,
+        "precip_only": {
+            "bins_1h_mm": aggregators_precip_only["bins_1h"].astype(float).tolist(),
+            "counts_1h": counts_1h_p.astype(int).tolist(),
+            "ratios_1h_percent": ratios_1h_p,
+            "total_1h": total_1h_p,
+            "bins_sum_mm": aggregators_precip_only["bins_sum"].astype(float).tolist(),
+            "counts_sum": counts_sum_p.astype(int).tolist(),
+            "ratios_sum_percent": ratios_sum_p,
+            "total_sum": total_sum_p
+        }
+    }
+    out["suggested_weights"] = {
+        "alpha": suggest_alpha,
+        "min": suggest_min,
+        "max": suggest_max,
+        "weights_1h": {
+            "bins_mm": aggregators["bins_1h"].astype(float).tolist(),
+            "values": suggested_weights_1h,
+            "counts": counts_1h_all.astype(int).tolist(),
+            "total": total_1h_all
+        },
+        "weights_sum": {
+            "bins_mm": aggregators["bins_sum"].astype(float).tolist(),
+            "values": suggested_weights_sum,
+            "counts": counts_sum_all.astype(int).tolist(),
+            "total": total_sum_all
+        }
+    }
+
     # コンソール概要（全データ）
     print("\n================== 降水ターゲットの乖離（mm） ==================")
     sd = out["metrics"]["sd_triplet_mm"]; rng = out["metrics"]["max_minus_min_mm"]
@@ -841,6 +1004,17 @@ def main():
     for k in ("corr(ft4,ft5)", "corr(ft4,ft6)", "corr(ft5,ft6)"):
         r = corr.get(k, None)
         print(f"{k}: r={('N/A' if r is None else f'{r:+.6f}')}")
+
+    # 降水強度ビン分布と提案重みの要約（全点）
+    print("\n================== 降水強度ビン分布（全点） ==================")
+    print(f"[1h bins(mm/h)] {out['intensity_distribution']['bins_1h_mm']}")
+    print(f"counts: {out['intensity_distribution']['counts_1h']}  total: {out['intensity_distribution']['total_1h']}")
+    print("ratios(%):", ", ".join(f"{v:.3f}" for v in out["intensity_distribution"]["ratios_1h_percent"]))
+    print(f"Suggested weights (1h): {', '.join(f'{w:.3f}' for w in out['suggested_weights']['weights_1h']['values'])}")
+    print(f"[sum bins(mm/3h)] {out['intensity_distribution']['bins_sum_mm']}")
+    print(f"counts: {out['intensity_distribution']['counts_sum']}  total: {out['intensity_distribution']['total_sum']}")
+    print("ratios(%):", ", ".join(f"{v:.3f}" for v in out["intensity_distribution"]["ratios_sum_percent"]))
+    print(f"Suggested weights (sum): {', '.join(f'{w:.3f}' for w in out['suggested_weights']['weights_sum']['values'])}")
 
     # コンソール概要（有降水のみ）
     print("\n================== 【有降水のみ】降水ターゲットの乖離（mm） ==================")
@@ -868,6 +1042,23 @@ def main():
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
     logging.info(f"[INFO] 解析結果を書き出しました: {out_path}")
+
+    # 追加: 提案重みを別JSONにも保存（設定ファイルへ貼り付けやすい形式）
+    suggest_payload = {
+        "bins_1h_mm": out["suggested_weights"]["weights_1h"]["bins_mm"],
+        "weights_1h": out["suggested_weights"]["weights_1h"]["values"],
+        "bins_sum_mm": out["suggested_weights"]["weights_sum"]["bins_mm"],
+        "weights_sum": out["suggested_weights"]["weights_sum"]["values"],
+        "alpha": out["suggested_weights"]["alpha"],
+        "min": out["suggested_weights"]["min"],
+        "max": out["suggested_weights"]["max"]
+    }
+    try:
+        with open(suggest_out_path, "w", encoding="utf-8") as f:
+            json.dump(suggest_payload, f, ensure_ascii=False, indent=2)
+        logging.info(f"[INFO] 提案重みを書き出しました: {suggest_out_path}")
+    except Exception as e:
+        logging.warning(f"[WARN] 提案重みの書き出しに失敗: {e}")
 
     # 可視化
     if not args.no_figs and HAS_MPL:
@@ -946,6 +1137,70 @@ def main():
             plt.close()
             logging.info(f"[FIG] Saved: {path}")
 
+        # 追加: 降水強度のビンラベル生成と分布/重みの棒グラフ
+        def labels_from_bins(bins: List[float]) -> List[str]:
+            if isinstance(bins, np.ndarray):
+                bs = bins.astype(float).tolist()
+            else:
+                bs = list(bins)
+            labels = []
+            if len(bs) == 0:
+                return [">-inf"]
+            labels.append(f"≤{bs[0]:g}")
+            for i in range(len(bs) - 1):
+                labels.append(f"({bs[i]:g},{bs[i+1]:g}]")
+            labels.append(f">{bs[-1]:g}")
+            return labels
+
+        def save_bar_distribution(bins: List[float], counts: List[int], total: int, title: str, path: Path, caption: Optional[str] = None, show_percent: bool = True):
+            if total <= 0:
+                logging.warning(f"[FIG] No data for {title}")
+                return
+            labels = labels_from_bins(bins)
+            if show_percent:
+                vals = [c / total * 100.0 for c in counts]
+                ylabel = "割合(%)"
+            else:
+                vals = list(counts)
+                ylabel = "カウント"
+            plt.figure(figsize=(max(8.0, 1.1*len(labels)), 5.0))
+            bars = plt.bar(labels, vals, color="#55A868")
+            plt.ylabel(ylabel)
+            plt.title(title)
+            for b, v in zip(bars, vals):
+                plt.text(b.get_x() + b.get_width()/2, v, f"{(v if not show_percent else round(v,1))}{'' if not show_percent else '%'}", ha="center", va="bottom", fontsize=8)
+            if caption:
+                cap = wrap_caption_text(caption, width=52)
+                nlines = cap.count("\n") + 1
+                bottom_margin = min(0.35, 0.12 + 0.022 * nlines)
+                plt.tight_layout(rect=(0.02, bottom_margin, 0.98, 0.98))
+                plt.gcf().text(0.5, bottom_margin * 0.45, cap, ha="center", va="bottom", fontsize=10)
+            else:
+                plt.tight_layout()
+            plt.savefig(path.as_posix(), dpi=150)
+            plt.close()
+            logging.info(f"[FIG] Saved: {path}")
+
+        def save_bar_weights(bins: List[float], weights: List[float], title: str, path: Path, caption: Optional[str] = None):
+            labels = labels_from_bins(bins)
+            plt.figure(figsize=(max(8.0, 1.1*len(labels)), 5.0))
+            bars = plt.bar(labels, weights, color="#C44E52")
+            plt.ylabel("重み")
+            plt.title(title)
+            for b, v in zip(bars, weights):
+                plt.text(b.get_x() + b.get_width()/2, v, f"{v:.2f}", ha="center", va="bottom", fontsize=8)
+            if caption:
+                cap = wrap_caption_text(caption, width=52)
+                nlines = cap.count("\n") + 1
+                bottom_margin = min(0.35, 0.12 + 0.022 * nlines)
+                plt.tight_layout(rect=(0.02, bottom_margin, 0.98, 0.98))
+                plt.gcf().text(0.5, bottom_margin * 0.45, cap, ha="center", va="bottom", fontsize=10)
+            else:
+                plt.tight_layout()
+            plt.savefig(path.as_posix(), dpi=150)
+            plt.close()
+            logging.info(f"[FIG] Saved: {path}")
+
         def save_hexbin(x: np.ndarray, y: np.ndarray, title: str, xlabel: str, ylabel: str, path: Path, gridsize: int = 60, caption: Optional[str] = None):
             if x.size == 0 or y.size == 0:
                 logging.warning(f"[FIG] No data for {title}")
@@ -1013,6 +1268,17 @@ def main():
         save_hexbin(p45x, p45y, "ft4 vs ft5", "ft4 (mm)", "ft5 (mm)", fig_dir / "precip_pair_ft4_ft5_hexbin.png", gridsize=int(args.hexbin_gridsize), caption=cap_p45)
         save_hexbin(p46x, p46y, "ft4 vs ft6", "ft4 (mm)", "ft6 (mm)", fig_dir / "precip_pair_ft4_ft6_hexbin.png", gridsize=int(args.hexbin_gridsize), caption=cap_p46)
         save_hexbin(p56x, p56y, "ft5 vs ft6", "ft5 (mm)", "ft6 (mm)", fig_dir / "precip_pair_ft5_ft6_hexbin.png", gridsize=int(args.hexbin_gridsize), caption=cap_p56)
+
+        # 追加: 降水強度分布と提案重みの棒グラフ
+        dist_cap = "降水強度（mm）を指定ビンに区分した分布。最終的な損失の強度重み推定の根拠。"
+        save_bar_distribution(out["intensity_distribution"]["bins_1h_mm"], out["intensity_distribution"]["counts_1h"], out["intensity_distribution"]["total_1h"], "1h降水 分布（全点）", fig_dir / "precip_1h_bins_all_bars.png", caption=dist_cap, show_percent=True)
+        save_bar_distribution(out["intensity_distribution"]["precip_only"]["bins_1h_mm"], out["intensity_distribution"]["precip_only"]["counts_1h"], out["intensity_distribution"]["precip_only"]["total_1h"], "1h降水 分布（有降水のみ）", fig_dir / "precip_1h_bins_precip_only_bars.png", caption=dist_cap, show_percent=True)
+        save_bar_distribution(out["intensity_distribution"]["bins_sum_mm"], out["intensity_distribution"]["counts_sum"], out["intensity_distribution"]["total_sum"], "3h積算 分布（全点）", fig_dir / "precip_sum_bins_all_bars.png", caption=dist_cap, show_percent=True)
+        save_bar_distribution(out["intensity_distribution"]["precip_only"]["bins_sum_mm"], out["intensity_distribution"]["precip_only"]["counts_sum"], out["intensity_distribution"]["precip_only"]["total_sum"], "3h積算 分布（有降水のみ）", fig_dir / "precip_sum_bins_precip_only_bars.png", caption=dist_cap, show_percent=True)
+
+        wcap = f"提案重み（w_i ∝ 1/p_i^{suggest_alpha}, クリップ[{suggest_min},{suggest_max}]）。最頻ビンの重みは1.0"
+        save_bar_weights(out["suggested_weights"]["weights_1h"]["bins_mm"], out["suggested_weights"]["weights_1h"]["values"], "提案重み（1h）", fig_dir / "suggested_weights_1h_bars.png", caption=wcap)
+        save_bar_weights(out["suggested_weights"]["weights_sum"]["bins_mm"], out["suggested_weights"]["weights_sum"]["values"], "提案重み（sum）", fig_dir / "suggested_weights_sum_bars.png", caption=wcap)
 
         # Markdown レポート
         md_path = (output_dir / "precip_analysis_README.md").resolve()
@@ -1087,6 +1353,33 @@ def main():
             for k in ("corr(ft4,ft5)", "corr(ft4,ft6)", "corr(ft5,ft6)"):
                 r = corr.get(k, None)
                 lines.append(f"- {k}: r={('N/A' if r is None else f'{r:+.6f}')}")
+            # 追加: 強度分布と重み提案のセクション
+            lines.append("")
+            lines.append("## 降水強度ビン分布と提案重み")
+            lines.append("")
+            lines.append(f"- 1h bins (mm/h): {json.dumps(out['intensity_distribution']['bins_1h_mm'])}")
+            lines.append(f"- 1h 提案重み: {json.dumps(out['suggested_weights']['weights_1h']['values'])}")
+            lines.append(f"- sum bins (mm/3h): {json.dumps(out['intensity_distribution']['bins_sum_mm'])}")
+            lines.append(f"- sum 提案重み: {json.dumps(out['suggested_weights']['weights_sum']['values'])}")
+            lines.append("")
+            lines.append("### 分布棒グラフ（全点）")
+            lines.append("![1h_all](precip_analysis_figs/precip_1h_bins_all_bars.png)")
+            lines.append("![sum_all](precip_analysis_figs/precip_sum_bins_all_bars.png)")
+            lines.append("")
+            lines.append("### 分布棒グラフ（有降水のみ）")
+            lines.append("![1h_precip](precip_analysis_figs/precip_1h_bins_precip_only_bars.png)")
+            lines.append("![sum_precip](precip_analysis_figs/precip_sum_bins_precip_only_bars.png)")
+            lines.append("")
+            lines.append("### 提案重みの棒グラフ")
+            lines.append("![w1h](precip_analysis_figs/suggested_weights_1h_bars.png)")
+            lines.append("![wsum](precip_analysis_figs/suggested_weights_sum_bars.png)")
+            lines.append("")
+            lines.append("### 設定ファイルへの反映例（swinunet_main_v5_config.py）")
+            lines.append("```python")
+            lines.append("CFG['LOSS']['intensity_weight_values_1h'] = " + json.dumps(out['suggested_weights']['weights_1h']['values']))
+            lines.append("CFG['LOSS']['intensity_weight_values_sum'] = " + json.dumps(out['suggested_weights']['weights_sum']['values']))
+            lines.append("```")
+
             md_path.parent.mkdir(parents=True, exist_ok=True)
             with open(md_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
