@@ -87,7 +87,7 @@ CFG = {
 
     # 学習/Loader
     "DATALOADER": {
-        "batch_size": 16,
+        "batch_size": 8,
         "num_workers": 4,
         "pin_memory": True,
     },

@@ -19,7 +19,7 @@ notify-run gpu01 -- nohup python3 check_output_nc.py > check_output_nc.log 2>&1 
 
 notify-run gpu01 -- nohup python swinunet_main_v2.py > swinunet_main_v2.log 2>&1 &
 
-notify-run gpu02 -- nohup python swinunet_main_v5.py > swinunet_main_v5.log 2>&1 &
+notify-run gpu01 -- nohup python swinunet_main_v5.py > swinunet_main_v5.log 2>&1 &
 
 notify-run gpu02 -- nohup python analyze_1h_bin_distribution.py > analyze_1h_bin_distribution.log 2>&1 &
 
