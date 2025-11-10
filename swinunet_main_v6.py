@@ -23,7 +23,7 @@ import torch.nn as nn
 import xarray as xr
 from swin_unet import SwinTransformerSys
 from torch.amp import GradScaler, autocast
-from CompresionRain.swinunet_main_v6_config import (
+from swinunet_main_v6_config import (
     CFG, SEED,
     DATA_DIR, TRAIN_YEARS, VALID_YEARS,
     RESULT_DIR, MODEL_SAVE_PATH, PLOT_SAVE_PATH, RESULT_IMG_DIR, RESULT_IMG_DIR_RN,
