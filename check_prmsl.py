@@ -722,7 +722,7 @@ def main():
     bins_sum_default = [2.0, 10.0, 20.0, 40.0, 60.0, 100.0]
     try:
         # 設定ファイルのLOSSビンを優先
-        from swinunet_main_v5_config import INTENSITY_WEIGHT_BINS_1H as _CFG_B1, INTENSITY_WEIGHT_BINS_SUM as _CFG_BS
+        from CompresionRain.swinunet_main_v6_config import INTENSITY_WEIGHT_BINS_1H as _CFG_B1, INTENSITY_WEIGHT_BINS_SUM as _CFG_BS
         if isinstance(_CFG_B1, list) and len(_CFG_B1) > 0:
             bins_1h_default = list(_CFG_B1)
         if isinstance(_CFG_BS, list) and len(_CFG_BS) > 0:
