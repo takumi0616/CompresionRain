@@ -133,9 +133,23 @@ CFG = {
     # 損失
     "LOSS": {
         "enable_intensity_weighted_loss": True,
+        
+        # 自動重み計算モード
+        # - "manual": 手動設定の重みを使用（従来通り）
+        # - "inverse_frequency": 逆頻度重み（データ分布から自動計算）
+        "weight_mode": "inverse_frequency",
+        
+        # 逆頻度重み計算のパラメータ
+        "inverse_frequency_params": {
+            "max_weight": 100.0,      # 最大重み（クリッピング上限）
+            "min_weight": 1.0,        # 最小重み
+            "smoothing_factor": 1e-6, # 0除算回避用の平滑化係数
+            "sample_ratio": 0.1,      # サンプリング比率（全データの何%を使用するか、1.0=全部）
+        },
 
-        # 1時間降水（mm/h）- 極端な重み（100倍）を避け、最大10倍に抑えて勾配爆発を防止
+        # 1時間降水（mm/h）- ビン境界
         "intensity_weight_bins_1h": [1.0, 5.0, 10.0, 20.0, 30.0, 50.0],
+        # 手動設定の重み（weight_mode="manual"の場合に使用）
         "intensity_weight_values_1h": [
             1.0,    # 0.0 - 1.0 mm
             5.0,    # 1.0 - 5.0 mm
@@ -146,8 +160,9 @@ CFG = {
             1000.0  # 50.0 mm 以上
         ],
 
-        # 3時間積算（mm/3h）- 同様に最大10倍に抑制
+        # 3時間積算（mm/3h）- ビン境界
         "intensity_weight_bins_sum": [2.0, 10.0, 20.0, 40.0, 60.0, 100.0],
+        # 手動設定の重み（weight_mode="manual"の場合に使用）
         "intensity_weight_values_sum": [
             1.0,    # 0.0 - 2.0 mm
             5.0,    # 2.0 - 10.0 mm

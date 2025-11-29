@@ -32,7 +32,7 @@ sudo kill -9 1493785
 ## gpu01 → mac
 
 ```bash
-rsync -avz --progress gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/CompresionRain/swin-unet_main_result_v5 /Users/takumi0616/Develop/docker_miniconda/src/CompresionRain/result_gpu02
+rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/CompresionRain/swin-unet_main_result_v6 /Users/takumi0616/Develop/docker_miniconda/src/CompresionRain/result_gpu01/inverse_frequency/
 ```
 
 ## 過去

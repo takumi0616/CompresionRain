@@ -41,6 +41,10 @@ from swinunet_main_v6_config import (
     WETHOUR_THRESHOLD_MM, LOGNORM_VMIN_MM,
     MODEL_ARGS, AMP_DTYPE, ALLOCATION_TAU
 )
+
+# 損失重み設定
+WEIGHT_MODE = CFG["LOSS"].get("weight_mode", "manual")
+INVERSE_FREQ_PARAMS = CFG["LOSS"].get("inverse_frequency_params", {})
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -471,6 +475,202 @@ class NetCDFDataset(Dataset):
 # 5. 損失関数、学習・検証関数
 # ==============================================================================
 
+# グローバル変数：動的に計算された重み（逆頻度重み使用時に上書き）
+# 初期値は設定ファイルの手動重みを使用
+_DYNAMIC_WEIGHT_VALUES_1H = list(INTENSITY_WEIGHT_VALUES_1H)
+_DYNAMIC_WEIGHT_VALUES_SUM = list(INTENSITY_WEIGHT_VALUES_SUM)
+
+
+def compute_inverse_frequency_weights(
+    dataset,
+    bins: list,
+    max_weight: float = 100.0,
+    min_weight: float = 1.0,
+    smoothing_factor: float = 1e-6,
+    sample_ratio: float = 0.1,
+    target_key: str = "target_1h",
+    logger=None
+) -> list:
+    """
+    概要:
+        データセットをサンプリングしてターゲット値の分布を集計し、各ビンの逆頻度重みを計算する。
+        稀な強度（大雨）に高い重みを、頻繁な強度（弱い雨/晴れ）に低い重みを自動で割り当てる。
+    
+    引数:
+        dataset (Dataset): 学習データセット。__getitem__ で target_key を含む dict を返す想定。
+        bins (List[float]): ビン境界（例: [1.0, 5.0, 10.0, 20.0, 30.0, 50.0]）。
+                           len(bins) 個の境界で len(bins)+1 個のビンが生成される。
+        max_weight (float): 最大重み（クリッピング上限）。勾配爆発を防ぐ。
+        min_weight (float): 最小重み。
+        smoothing_factor (float): 0除算回避用の平滑化係数。
+        sample_ratio (float): サンプリング比率（0.0 < ratio <= 1.0）。
+                             1.0 なら全データ、0.1 なら 10% をランダムサンプリング。
+        target_key (str): データセットから取得するターゲットのキー名。
+        logger: ロガー（None の場合は print を使用）。
+    
+    処理:
+        1. データセットから sample_ratio 分のサンプルをランダムに選択
+        2. 各サンプルのターゲット値を bins に従ってビンに分類
+        3. 各ビンの出現頻度を集計
+        4. 逆頻度重み = 1 / (頻度 + smoothing_factor) を計算
+        5. 最小重みを min_weight に正規化し、max_weight でクリッピング
+    
+    戻り値:
+        List[float]: 長さ len(bins)+1 の重みリスト。
+                    [bin0の重み, bin1の重み, ..., 最後のビンの重み]
+    
+    例:
+        bins = [1.0, 5.0, 10.0]
+        結果: [w0, w1, w2, w3]
+            w0: 0.0 ≤ x < 1.0 の重み
+            w1: 1.0 ≤ x < 5.0 の重み
+            w2: 5.0 ≤ x < 10.0 の重み
+            w3: x ≥ 10.0 の重み
+    """
+    log_func = logger.info if logger else print
+    
+    num_bins = len(bins) + 1
+    bin_counts = np.zeros(num_bins, dtype=np.float64)
+    
+    # サンプリングするインデックスを決定
+    total_samples = len(dataset)
+    if sample_ratio >= 1.0:
+        sample_indices = list(range(total_samples))
+    else:
+        num_samples = max(1, int(total_samples * sample_ratio))
+        sample_indices = np.random.choice(total_samples, size=num_samples, replace=False).tolist()
+    
+    log_func(f"[逆頻度重み] サンプリング: {len(sample_indices)}/{total_samples} サンプル ({sample_ratio*100:.1f}%)")
+    
+    # 各サンプルのターゲット値を集計
+    bins_array = np.array(bins, dtype=np.float64)
+    
+    for idx in tqdm(sample_indices, desc="Computing inverse frequency weights", disable=(logger is None)):
+        sample = dataset[idx]
+        target = sample[target_key]
+        
+        # Tensor → numpy
+        if isinstance(target, torch.Tensor):
+            target = target.numpy()
+        
+        # 全画素をフラット化
+        flat_values = target.flatten()
+        
+        # np.digitize: 各値がどのビンに属するかを計算
+        # right=False なので bins[i-1] <= x < bins[i] でビン i に割り当て
+        # 戻り値は 1..len(bins)+1 なので -1 して 0..len(bins) にする
+        bin_indices = np.digitize(flat_values, bins_array, right=False)
+        
+        # 各ビンの出現回数をカウント
+        for i in range(num_bins):
+            bin_counts[i] += np.sum(bin_indices == i)
+    
+    # 頻度を正規化（合計を1に）
+    total_count = bin_counts.sum()
+    if total_count > 0:
+        frequencies = bin_counts / total_count
+    else:
+        frequencies = np.ones(num_bins) / num_bins
+    
+    # 逆頻度重みを計算
+    inverse_weights = 1.0 / (frequencies + smoothing_factor)
+    
+    # 最小値を min_weight に正規化
+    inverse_weights = inverse_weights / inverse_weights.min() * min_weight
+    
+    # 最大重みでクリッピング
+    inverse_weights = np.clip(inverse_weights, min_weight, max_weight)
+    
+    weights_list = inverse_weights.tolist()
+    
+    # 結果をログ出力
+    log_func(f"[逆頻度重み] ビン境界: {bins}")
+    log_func(f"[逆頻度重み] ビン出現数: {bin_counts.astype(int).tolist()}")
+    log_func(f"[逆頻度重み] ビン頻度:   {[f'{f:.6f}' for f in frequencies]}")
+    log_func(f"[逆頻度重み] 計算された重み: {[f'{w:.2f}' for w in weights_list]}")
+    
+    return weights_list
+
+
+def compute_all_inverse_frequency_weights(train_dataset, logger=None) -> tuple:
+    """
+    概要:
+        学習データセットから 1時間降水と3時間積算の両方について逆頻度重みを計算する。
+    
+    引数:
+        train_dataset (Dataset): 学習データセット。
+        logger: ロガー。
+    
+    戻り値:
+        Tuple[List[float], List[float]]: (1h用重み, sum用重み)
+    """
+    log_func = logger.info if logger else print
+    params = INVERSE_FREQ_PARAMS
+    
+    max_weight = params.get("max_weight", 100.0)
+    min_weight = params.get("min_weight", 1.0)
+    smoothing = params.get("smoothing_factor", 1e-6)
+    sample_ratio = params.get("sample_ratio", 0.1)
+    
+    log_func("="*60)
+    log_func("[逆頻度重み] 1時間降水量の重みを計算中...")
+    log_func("="*60)
+    
+    weights_1h = compute_inverse_frequency_weights(
+        dataset=train_dataset,
+        bins=INTENSITY_WEIGHT_BINS_1H,
+        max_weight=max_weight,
+        min_weight=min_weight,
+        smoothing_factor=smoothing,
+        sample_ratio=sample_ratio,
+        target_key="target_1h",
+        logger=logger
+    )
+    
+    log_func("")
+    log_func("="*60)
+    log_func("[逆頻度重み] 3時間積算降水量の重みを計算中...")
+    log_func("="*60)
+    
+    weights_sum = compute_inverse_frequency_weights(
+        dataset=train_dataset,
+        bins=INTENSITY_WEIGHT_BINS_SUM,
+        max_weight=max_weight,
+        min_weight=min_weight,
+        smoothing_factor=smoothing,
+        sample_ratio=sample_ratio,
+        target_key="target_sum",
+        logger=logger
+    )
+    
+    return weights_1h, weights_sum
+
+
+def update_dynamic_weights(weights_1h: list, weights_sum: list):
+    """
+    概要:
+        グローバル変数の動的重みを更新する。
+    
+    引数:
+        weights_1h (List[float]): 1時間降水用の重み。
+        weights_sum (List[float]): 3時間積算用の重み。
+    """
+    global _DYNAMIC_WEIGHT_VALUES_1H, _DYNAMIC_WEIGHT_VALUES_SUM
+    _DYNAMIC_WEIGHT_VALUES_1H = list(weights_1h)
+    _DYNAMIC_WEIGHT_VALUES_SUM = list(weights_sum)
+
+
+def get_current_weight_values():
+    """
+    概要:
+        現在使用中の重み値を取得する。
+    
+    戻り値:
+        Tuple[List[float], List[float]]: (1h用重み, sum用重み)
+    """
+    return _DYNAMIC_WEIGHT_VALUES_1H, _DYNAMIC_WEIGHT_VALUES_SUM
+
+
 def _get_weight_map_from_bins(target_tensor, bin_edges, weight_values):
     """
     概要:
@@ -550,10 +750,12 @@ def custom_loss_function(output, targets, eps=1e-8):
     unweighted_mse_sum = nn.functional.mse_loss(predicted_sum.float(), target_sum.float())
 
     if ENABLE_INTENSITY_WEIGHTED_LOSS:
+        # 動的に計算された重みを使用（逆頻度重みモード時はupdate_dynamic_weightsで更新済み）
+        weights_1h, weights_sum = get_current_weight_values()
         # 1時間（3ch）は強度重み付きMSE
-        loss_1h_mse = _weighted_mse(pred_1h_mm, target_1h, INTENSITY_WEIGHT_BINS_1H, INTENSITY_WEIGHT_VALUES_1H)
+        loss_1h_mse = _weighted_mse(pred_1h_mm, target_1h, INTENSITY_WEIGHT_BINS_1H, weights_1h)
         # 積算も強度重み付きMSE（理論上は w の和=1 で一致するが、数値誤差に備えて保持）
-        loss_sum_mse = _weighted_mse(predicted_sum, target_sum, INTENSITY_WEIGHT_BINS_SUM, INTENSITY_WEIGHT_VALUES_SUM)
+        loss_sum_mse = _weighted_mse(predicted_sum, target_sum, INTENSITY_WEIGHT_BINS_SUM, weights_sum)
     else:
         loss_1h_mse = unweighted_mse_1h
         loss_sum_mse = unweighted_mse_sum
@@ -1842,6 +2044,49 @@ def main_worker(rank, world_size, train_files, valid_files):
     
     train_dataset = NetCDFDataset(train_files, logger=(main_log if rank == 0 else None))
     valid_dataset = NetCDFDataset(valid_files, logger=(main_log if rank == 0 else None))
+    
+    # =====================================
+    # 逆頻度重みの自動計算（rank 0 のみ）
+    # =====================================
+    if rank == 0 and ENABLE_INTENSITY_WEIGHTED_LOSS and WEIGHT_MODE == "inverse_frequency":
+        main_log.info("")
+        main_log.info("="*60)
+        main_log.info("[v6] 逆頻度重み計算モード: inverse_frequency")
+        main_log.info("="*60)
+        weights_1h, weights_sum = compute_all_inverse_frequency_weights(train_dataset, logger=main_log)
+        update_dynamic_weights(weights_1h, weights_sum)
+        main_log.info("")
+        main_log.info("[v6] 動的重みが更新されました:")
+        main_log.info(f"  1h weights: {[f'{w:.2f}' for w in weights_1h]}")
+        main_log.info(f"  Sum weights: {[f'{w:.2f}' for w in weights_sum]}")
+        main_log.info("")
+        
+        # 計算された重みをファイルに保存（再現性のため）
+        weights_save_path = os.path.join(RESULT_DIR, "computed_weights_v6.json")
+        weights_data = {
+            "weight_mode": WEIGHT_MODE,
+            "inverse_frequency_params": INVERSE_FREQ_PARAMS,
+            "bins_1h": INTENSITY_WEIGHT_BINS_1H,
+            "bins_sum": INTENSITY_WEIGHT_BINS_SUM,
+            "computed_weights_1h": weights_1h,
+            "computed_weights_sum": weights_sum
+        }
+        with open(weights_save_path, 'w', encoding='utf-8') as f:
+            json.dump(weights_data, f, indent=2, ensure_ascii=False)
+        main_log.info(f"[v6] 計算された重みを保存: {weights_save_path}")
+    elif rank == 0 and ENABLE_INTENSITY_WEIGHTED_LOSS and WEIGHT_MODE == "manual":
+        main_log.info("[v6] 手動重みモード: 設定ファイルの重みをそのまま使用")
+        main_log.info(f"  1h weights: {INTENSITY_WEIGHT_VALUES_1H}")
+        main_log.info(f"  Sum weights: {INTENSITY_WEIGHT_VALUES_SUM}")
+    
+    # DDP: 重みを全プロセスで同期（rank 0 で計算した重みを broadcast）
+    if world_size > 1 and ENABLE_INTENSITY_WEIGHTED_LOSS and WEIGHT_MODE == "inverse_frequency":
+        weights_1h_tensor = torch.tensor(_DYNAMIC_WEIGHT_VALUES_1H, dtype=torch.float64, device=dev)
+        weights_sum_tensor = torch.tensor(_DYNAMIC_WEIGHT_VALUES_SUM, dtype=torch.float64, device=dev)
+        dist.broadcast(weights_1h_tensor, src=0)
+        dist.broadcast(weights_sum_tensor, src=0)
+        if rank != 0:
+            update_dynamic_weights(weights_1h_tensor.cpu().tolist(), weights_sum_tensor.cpu().tolist())
     
     if world_size > 1:
         train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=False)
