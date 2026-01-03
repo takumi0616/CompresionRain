@@ -9,7 +9,29 @@
 # - v3の機能（DDP、詳細メトリクス、可視化、動画化など）はすべて踏襲
 # - 保存先ディレクトリやログのバージョン表記をv5に更新
 
+# ============================================================================== 
+# CRITICAL: GPU設定はtorch import前に行う必要があるため、最初にargparseを実行
+# ============================================================================== 
+import sys
+import argparse
+
+# コマンドライン引数を最初に解析（torch import前）
+_parser = argparse.ArgumentParser(description='Swin-UNet v5 Training Script')
+_parser.add_argument('-use-gpu', '--use-gpu', type=str, default='ddp', 
+                    choices=['0', '1', 'ddp'],
+                    help='GPU selection: 0 (GPU0 only), 1 (GPU1 only), ddp (GPU0+1 with DDP)')
+_args = _parser.parse_args()
+
+# GPU設定（torch import前に実行）
 import os
+if _args.use_gpu == '0':
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+elif _args.use_gpu == '1':
+    os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+else:  # ddp
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+
+# ここからメインのimport
 import glob
 import warnings
 import matplotlib.pyplot as plt
@@ -1797,11 +1819,19 @@ def main_worker(rank, world_size, train_files, valid_files):
 # 8. メイン実行ブロック
 # ==============================================================================
 if __name__ == '__main__':
+    # 引数は既にファイル先頭で解析済み（_args）
+    args = _args
+    
+    # GPU設定の確認（既にCUDA_VISIBLE_DEVICESは設定済み）
+    force_single_gpu = (args.use_gpu in ['0', '1'])
+    
     set_seed(RANDOM_SEED)
 
     os.makedirs(RESULT_DIR, exist_ok=True)
     
     main_logger, _ = setup_loggers()
+    
+    main_logger.info(f"[GPU Mode] -use-gpu={args.use_gpu}, CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}")
 
     if CARTOPY_AVAILABLE:
         main_logger.info("Cartopyの地図データを事前にダウンロードします...")
@@ -1831,20 +1861,26 @@ if __name__ == '__main__':
         main_logger.info(f"学習ファイル数: {len(train_files)}")
         main_logger.info(f"検証ファイル数: {len(valid_files)}")
         
-        world_size = torch.cuda.device_count()
-        if world_size > 1:
-            main_logger.info(f"{world_size}個のGPUを検出。DDPを開始します。")
-            try:
-                mp.spawn(main_worker,
-                         args=(world_size, train_files, valid_files),
-                         nprocs=world_size,
-                         join=True)
-            except Exception as e:
-                main_logger.error(f"DDP 実行中にエラーが発生しました: {e}")
-                main_logger.warning("DDPをスキップしてシングルGPUモードで継続します。")
-                main_worker(0, 1, train_files, valid_files)
-        elif world_size == 1:
-            main_logger.info("1個のGPUを検出。シングルGPUモードで実行します。")
+        if force_single_gpu:
+            # シングルGPUモード（-use-gpu 0 or 1）
+            main_logger.info(f"[シングルGPUモード] GPU {args.use_gpu} を使用します。")
             main_worker(0, 1, train_files, valid_files)
         else:
-            main_logger.error("GPUが見つかりません。このスクリプトはGPUが必要です。")
+            # DDPモード（-use-gpu ddp）
+            world_size = torch.cuda.device_count()
+            if world_size >= 2:
+                main_logger.info(f"[DDPモード] {world_size}個のGPUを検出。DDPを開始します。")
+                try:
+                    mp.spawn(main_worker,
+                             args=(world_size, train_files, valid_files),
+                             nprocs=world_size,
+                             join=True)
+                except Exception as e:
+                    main_logger.error(f"DDP 実行中にエラーが発生しました: {e}")
+                    main_logger.warning("DDPをスキップしてシングルGPUモードで継続します。")
+                    main_worker(0, 1, train_files, valid_files)
+            elif world_size == 1:
+                main_logger.warning("DDPモードが指定されましたが、GPUが1個しか検出されませんでした。シングルGPUモードで実行します。")
+                main_worker(0, 1, train_files, valid_files)
+            else:
+                main_logger.error("GPUが見つかりません。このスクリプトはGPUが必要です。")
